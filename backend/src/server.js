@@ -9,15 +9,18 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+const MAX_POSITIONS = 5;
+
 // ===== INIT DB =====
 async function initDB() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS state (
-      id INT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS positions (
+      id SERIAL PRIMARY KEY,
+      symbol TEXT,
+      entry_price FLOAT,
       capital FLOAT,
-      position TEXT,
-      coin TEXT,
-      entry_price FLOAT
+      status TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
     )
   `);
 
@@ -39,77 +42,40 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS weights (
       id INT PRIMARY KEY,
-      momentum FLOAT,
-      zone FLOAT,
-      volume FLOAT
+      momentum FLOAT
     )
   `);
 
-  const s = await pool.query(`SELECT * FROM state WHERE id=1`);
-  if (s.rows.length === 0) {
-    await pool.query(`INSERT INTO state VALUES (1, 100, 'NONE', NULL, NULL)`);
-  }
-
   const w = await pool.query(`SELECT * FROM weights WHERE id=1`);
   if (w.rows.length === 0) {
-    await pool.query(`INSERT INTO weights VALUES (1, 1.2, 2, 0.3)`);
+    await pool.query(`INSERT INTO weights VALUES (1, 1.2)`);
   }
 }
 
 // ===== SCORING =====
-function scoreCoin(c, weights) {
-  const change = c.change;
-
-  if (change > 6 || change < -3) return -999;
-
-  const momentum = change > 0 ? change : 0;
-
-  let zoneBonus = 0;
-  if (change >= 1 && change <= 3) zoneBonus = 1;
-  else if (change > 3 && change <= 5) zoneBonus = 0.5;
-
-  const volumeScore = Math.log10(c.volume || 1);
-
-  return (
-    momentum * weights.momentum +
-    zoneBonus * weights.zone +
-    volumeScore * weights.volume
-  );
+function scoreCoin(c, w) {
+  if (c.change > 6 || c.change < -3) return -999;
+  const momentum = c.change > 0 ? c.change : 0;
+  return momentum * w.momentum + Math.log10(c.volume || 1);
 }
 
 // ===== LEARNING =====
 async function updateWeights() {
-  const trades = await pool.query(`
-    SELECT * FROM trades
-    WHERE pnl IS NOT NULL
-    ORDER BY created_at DESC
-    LIMIT 50
+  const res = await pool.query(`
+    SELECT * FROM trades WHERE pnl IS NOT NULL
+    ORDER BY created_at DESC LIMIT 50
   `);
 
-  if (trades.rows.length < 10) return;
+  if (res.rows.length < 10) return;
 
   let win = 0, loss = 0;
-  let winMomentum = 0, lossMomentum = 0;
 
-  trades.rows.forEach(t => {
-    if (t.pnl > 0) {
-      win++;
-      winMomentum += t.change || 0;
-    } else {
-      loss++;
-      lossMomentum += t.change || 0;
-    }
+  res.rows.forEach(t => {
+    if (t.pnl > 0) win++;
+    else loss++;
   });
 
-  if (win === 0 || loss === 0) return;
-
-  const avgWin = winMomentum / win;
-  const avgLoss = lossMomentum / loss;
-
-  let newWeight = 1.2;
-
-  if (avgWin > avgLoss) newWeight += 0.1;
-  else newWeight -= 0.1;
+  let newWeight = 1.2 + (win - loss) * 0.01;
 
   await pool.query(
     `UPDATE weights SET momentum=$1 WHERE id=1`,
@@ -122,28 +88,9 @@ app.get('/', async (req, res) => {
   try {
     await initDB();
 
-    const dbState = await pool.query(`SELECT * FROM state WHERE id=1`);
-    const weightData = await pool.query(`SELECT * FROM weights WHERE id=1`);
+    const weights = (await pool.query(`SELECT * FROM weights WHERE id=1`)).rows[0];
 
-    const weights = weightData.rows[0];
-
-    let capital = dbState.rows[0].capital;
-    let position = dbState.rows[0].position || "NONE";
-    let currentCoin = dbState.rows[0].coin;
-    let entryPrice = dbState.rows[0].entry_price;
-
-    if (position === "HOLDING" && !entryPrice) {
-      position = "NONE";
-      currentCoin = null;
-    }
-
-    const tradesResult = await pool.query(
-      `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
-    );
-
-    const response = await axios.get(
-      'https://api.binance.com/api/v3/ticker/24hr'
-    );
+    const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr');
 
     const coins = response.data
       .filter(c => {
@@ -151,7 +98,6 @@ app.get('/', async (req, res) => {
         return (
           s.endsWith("USDT") &&
           parseFloat(c.volume) > 1000000 &&
-          parseFloat(c.lastPrice) > 0 &&
           !s.includes("UP") &&
           !s.includes("DOWN") &&
           !s.includes("BULL") &&
@@ -172,117 +118,89 @@ app.get('/', async (req, res) => {
     }));
 
     const top5 = scored.sort((a, b) => b.score - a.score).slice(0, 5);
-    const best = top5[0];
 
-    let action = "HOLD";
-    let pnl = 0;
+    const positions = (await pool.query(
+      `SELECT * FROM positions WHERE status='OPEN'`
+    )).rows;
 
-    // ENTRY
-    if (position === "NONE") {
-      if (best.change >= 1 && best.change <= 5) {
-        position = "HOLDING";
-        currentCoin = best.symbol;
-        entryPrice = best.price;
-        action = "BUY";
+    let capitalPerTrade = 100 / MAX_POSITIONS;
 
-        await pool.query(
-          `INSERT INTO trades(symbol, action, price, capital, change, score, volume)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [best.symbol, action, best.price, capital, best.change, best.score, best.volume]
-        );
+    // ===== ENTRY =====
+    for (let coin of top5) {
+      if (positions.length >= MAX_POSITIONS) break;
+
+      const already = positions.find(p => p.symbol === coin.symbol);
+      if (already) continue;
+
+      if (coin.change >= 1 && coin.change <= 5) {
+        await pool.query(`
+          INSERT INTO positions(symbol, entry_price, capital, status)
+          VALUES ($1,$2,$3,'OPEN')
+        `, [coin.symbol, coin.price, capitalPerTrade]);
+
+        await pool.query(`
+          INSERT INTO trades(symbol, action, price, capital, change, score, volume)
+          VALUES ($1,'BUY',$2,$3,$4,$5,$6)
+        `, [coin.symbol, coin.price, capitalPerTrade, coin.change, coin.score, coin.volume]);
       }
     }
 
-    // EXIT
-    else if (position === "HOLDING") {
-      const current = coins.find(c => c.symbol === currentCoin);
+    // ===== EXIT =====
+    let updatedPositions = [];
 
-      if (current && entryPrice) {
-        pnl = (current.price - entryPrice) / entryPrice;
+    for (let pos of positions) {
+      const current = coins.find(c => c.symbol === pos.symbol);
+      if (!current) continue;
 
-        if (pnl >= 0.02 || pnl <= -0.01) {
-          capital *= (1 + pnl);
+      const pnl = (current.price - pos.entry_price) / pos.entry_price;
 
-          action = pnl > 0 ? "SELL (TP)" : "SELL (SL)";
+      if (pnl >= 0.02 || pnl <= -0.01) {
+        await pool.query(`
+          UPDATE positions SET status='CLOSED' WHERE id=$1
+        `, [pos.id]);
 
-          await pool.query(
-            `INSERT INTO trades(symbol, action, price, capital, pnl)
-             VALUES ($1,$2,$3,$4,$5)`,
-            [currentCoin, action, current.price, capital, pnl]
-          );
+        await pool.query(`
+          INSERT INTO trades(symbol, action, price, capital, pnl)
+          VALUES ($1,$2,$3,$4,$5)
+        `, [pos.symbol, pnl > 0 ? 'SELL (TP)' : 'SELL (SL)', current.price, pos.capital, pnl]);
 
-          position = "NONE";
-          currentCoin = null;
-          entryPrice = null;
-
-          await updateWeights();
-        }
+        await updateWeights();
+      } else {
+        updatedPositions.push({ ...pos, pnl });
       }
     }
 
-    await pool.query(
-      `UPDATE state SET capital=$1, position=$2, coin=$3, entry_price=$4 WHERE id=1`,
-      [capital, position, currentCoin, entryPrice]
-    );
+    const trades = (await pool.query(
+      `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
+    )).rows;
 
     // ===== UI =====
     res.send(`
       <html>
-      <head>
-        <title>Crypto ML Dashboard</title>
-        <meta http-equiv="refresh" content="5">
-        <style>
-          body { font-family: Arial; background:#0f172a; color:white; padding:20px; }
-          .card { background:#1e293b; padding:20px; margin-bottom:15px; border-radius:10px; }
-          .green { color:#22c55e; }
-          .red { color:#ef4444; }
-        </style>
-      </head>
-      <body>
+      <body style="background:#0f172a;color:white;font-family:Arial;padding:20px">
 
-        <h1>🚀 Crypto ML Dashboard (Learning Engine)</h1>
+      <h1>🚀 Multi-Position ML Engine</h1>
 
-        <div class="card">
-          <h2>💰 Capital: €${capital.toFixed(2)}</h2>
-        </div>
+      <h2>Weights: ${weights.momentum.toFixed(2)}</h2>
 
-        <div class="card">
-          <h3>🏆 Best Coin</h3>
-          <p>${best.symbol}</p>
-          <p>Score: ${best.score.toFixed(2)}</p>
-          <p>Change: ${best.change.toFixed(2)}%</p>
-        </div>
+      <h3>📊 Top 5</h3>
+      <ul>
+        ${top5.map(c => `<li>${c.symbol} ${c.change.toFixed(2)}%</li>`).join('')}
+      </ul>
 
-        <div class="card">
-          <h3>📊 Top 5</h3>
-          <ul>
-            ${top5.map(c => `<li>${c.symbol} | ${c.change.toFixed(2)}%</li>`).join('')}
-          </ul>
-        </div>
+      <h3>📌 Active Positions (${updatedPositions.length})</h3>
+      <ul>
+        ${updatedPositions.map(p => `
+          <li>${p.symbol} | Entry ${p.entry_price} | PnL ${(p.pnl*100).toFixed(2)}%</li>
+        `).join('')}
+      </ul>
 
-        <div class="card">
-          <h3>⚙️ Weights</h3>
-          <p>Momentum: ${weights.momentum.toFixed(2)}</p>
-        </div>
-
-        <div class="card">
-          <h3>📌 Position</h3>
-          <p>${position} ${currentCoin || ""}</p>
-          <p>Entry: ${entryPrice || "-"}</p>
-          <p>PnL: ${(pnl * 100).toFixed(2)}%</p>
-        </div>
-
-        <div class="card">
-          <h3>📜 Recent Trades</h3>
-          <ul>
-            ${tradesResult.rows.map(t => `
-              <li>
-                ${t.action} ${t.symbol} → €${Number(t.capital).toFixed(2)}
-                ${t.pnl ? `(${(t.pnl*100).toFixed(2)}%)` : ""}
-              </li>
-            `).join('')}
-          </ul>
-        </div>
+      <h3>📜 Recent Trades</h3>
+      <ul>
+        ${trades.map(t => `
+          <li>${t.action} ${t.symbol} (${t.pnl ? (t.pnl*100).toFixed(2)+'%' : ''})</li>
+        `).join('')}
+      </ul>
 
       </body>
       </html>

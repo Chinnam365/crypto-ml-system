@@ -45,22 +45,18 @@ async function initDB() {
     )
   `);
 
-  // Init state
   const s = await pool.query(`SELECT * FROM state WHERE id=1`);
   if (s.rows.length === 0) {
     await pool.query(`INSERT INTO state VALUES (1, 100, 'NONE', NULL, NULL)`);
   }
 
-  // Init weights
   const w = await pool.query(`SELECT * FROM weights WHERE id=1`);
   if (w.rows.length === 0) {
-    await pool.query(`
-      INSERT INTO weights VALUES (1, 1.2, 2, 0.3)
-    `);
+    await pool.query(`INSERT INTO weights VALUES (1, 1.2, 2, 0.3)`);
   }
 }
 
-// ===== SCORING (DYNAMIC) =====
+// ===== SCORING =====
 function scoreCoin(c, weights) {
   const change = c.change;
 
@@ -81,7 +77,7 @@ function scoreCoin(c, weights) {
   );
 }
 
-// ===== LEARNING FUNCTION =====
+// ===== LEARNING =====
 async function updateWeights() {
   const trades = await pool.query(`
     SELECT * FROM trades
@@ -90,37 +86,35 @@ async function updateWeights() {
     LIMIT 50
   `);
 
-  if (trades.rows.length < 10) return; // not enough data
+  if (trades.rows.length < 10) return;
 
+  let win = 0, loss = 0;
   let winMomentum = 0, lossMomentum = 0;
-  let winCount = 0, lossCount = 0;
 
   trades.rows.forEach(t => {
     if (t.pnl > 0) {
-      winMomentum += t.change;
-      winCount++;
+      win++;
+      winMomentum += t.change || 0;
     } else {
-      lossMomentum += t.change;
-      lossCount++;
+      loss++;
+      lossMomentum += t.change || 0;
     }
   });
 
-  if (winCount === 0 || lossCount === 0) return;
+  if (win === 0 || loss === 0) return;
 
-  const avgWin = winMomentum / winCount;
-  const avgLoss = lossMomentum / lossCount;
+  const avgWin = winMomentum / win;
+  const avgLoss = lossMomentum / loss;
 
-  let newMomentumWeight = 1.2;
+  let newWeight = 1.2;
 
-  if (avgWin > avgLoss) {
-    newMomentumWeight += 0.1;
-  } else {
-    newMomentumWeight -= 0.1;
-  }
+  if (avgWin > avgLoss) newWeight += 0.1;
+  else newWeight -= 0.1;
 
-  await pool.query(`
-    UPDATE weights SET momentum=$1 WHERE id=1
-  `, [Math.max(0.5, Math.min(newMomentumWeight, 3))]);
+  await pool.query(
+    `UPDATE weights SET momentum=$1 WHERE id=1`,
+    [Math.max(0.5, Math.min(newWeight, 3))]
+  );
 }
 
 // ===== MAIN =====
@@ -142,6 +136,10 @@ app.get('/', async (req, res) => {
       position = "NONE";
       currentCoin = null;
     }
+
+    const tradesResult = await pool.query(
+      `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
+    );
 
     const response = await axios.get(
       'https://api.binance.com/api/v3/ticker/24hr'
@@ -187,10 +185,11 @@ app.get('/', async (req, res) => {
         entryPrice = best.price;
         action = "BUY";
 
-        await pool.query(`
-          INSERT INTO trades(symbol, action, price, capital, change, score, volume)
-          VALUES ($1,$2,$3,$4,$5,$6,$7)
-        `, [best.symbol, action, best.price, capital, best.change, best.score, best.volume]);
+        await pool.query(
+          `INSERT INTO trades(symbol, action, price, capital, change, score, volume)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [best.symbol, action, best.price, capital, best.change, best.score, best.volume]
+        );
       }
     }
 
@@ -206,33 +205,87 @@ app.get('/', async (req, res) => {
 
           action = pnl > 0 ? "SELL (TP)" : "SELL (SL)";
 
-          await pool.query(`
-            INSERT INTO trades(symbol, action, price, capital, pnl)
-            VALUES ($1,$2,$3,$4,$5)
-          `, [currentCoin, action, current.price, capital, pnl]);
+          await pool.query(
+            `INSERT INTO trades(symbol, action, price, capital, pnl)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [currentCoin, action, current.price, capital, pnl]
+          );
 
           position = "NONE";
           currentCoin = null;
           entryPrice = null;
 
-          await updateWeights(); // 🔥 LEARNING TRIGGER
+          await updateWeights();
         }
       }
     }
 
-    await pool.query(`
-      UPDATE state SET capital=$1, position=$2, coin=$3, entry_price=$4 WHERE id=1
-    `, [capital, position, currentCoin, entryPrice]);
+    await pool.query(
+      `UPDATE state SET capital=$1, position=$2, coin=$3, entry_price=$4 WHERE id=1`,
+      [capital, position, currentCoin, entryPrice]
+    );
 
+    // ===== UI =====
     res.send(`
-      <html><body style="background:#0f172a;color:white;font-family:Arial;padding:20px">
-      <h1>🚀 Crypto ML (Learning Engine)</h1>
-      <h2>Capital: €${capital.toFixed(2)}</h2>
-      <h3>Best: ${best.symbol} (${best.change.toFixed(2)}%)</h3>
-      <h3>Weights: M=${weights.momentum.toFixed(2)}</h3>
-      <h3>Position: ${position} ${currentCoin || ""}</h3>
-      <h3>PnL: ${(pnl*100).toFixed(2)}%</h3>
-      </body></html>
+      <html>
+      <head>
+        <title>Crypto ML Dashboard</title>
+        <meta http-equiv="refresh" content="5">
+        <style>
+          body { font-family: Arial; background:#0f172a; color:white; padding:20px; }
+          .card { background:#1e293b; padding:20px; margin-bottom:15px; border-radius:10px; }
+          .green { color:#22c55e; }
+          .red { color:#ef4444; }
+        </style>
+      </head>
+      <body>
+
+        <h1>🚀 Crypto ML Dashboard (Learning Engine)</h1>
+
+        <div class="card">
+          <h2>💰 Capital: €${capital.toFixed(2)}</h2>
+        </div>
+
+        <div class="card">
+          <h3>🏆 Best Coin</h3>
+          <p>${best.symbol}</p>
+          <p>Score: ${best.score.toFixed(2)}</p>
+          <p>Change: ${best.change.toFixed(2)}%</p>
+        </div>
+
+        <div class="card">
+          <h3>📊 Top 5</h3>
+          <ul>
+            ${top5.map(c => `<li>${c.symbol} | ${c.change.toFixed(2)}%</li>`).join('')}
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3>⚙️ Weights</h3>
+          <p>Momentum: ${weights.momentum.toFixed(2)}</p>
+        </div>
+
+        <div class="card">
+          <h3>📌 Position</h3>
+          <p>${position} ${currentCoin || ""}</p>
+          <p>Entry: ${entryPrice || "-"}</p>
+          <p>PnL: ${(pnl * 100).toFixed(2)}%</p>
+        </div>
+
+        <div class="card">
+          <h3>📜 Recent Trades</h3>
+          <ul>
+            ${tradesResult.rows.map(t => `
+              <li>
+                ${t.action} ${t.symbol} → €${Number(t.capital).toFixed(2)}
+                ${t.pnl ? `(${(t.pnl*100).toFixed(2)}%)` : ""}
+              </li>
+            `).join('')}
+          </ul>
+        </div>
+
+      </body>
+      </html>
     `);
 
   } catch (err) {

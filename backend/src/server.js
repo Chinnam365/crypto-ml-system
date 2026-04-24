@@ -137,10 +137,16 @@ app.get('/', async (req, res) => {
       const exists = positions.find(p => p.symbol === coin.symbol);
       if (exists) continue;
 
-      // SIMPLE diversification (avoid same starting letter cluster)
-      const prefix = coin.symbol.substring(0, 3);
-      const similar = positions.find(p => p.symbol.substring(0, 3) === prefix);
-      if (similar) continue;
+      // Stronger diversification: avoid same price range clustering
+const similar = positions.find(p => {
+  const existing = coins.find(c => c.symbol === p.symbol);
+  if (!existing) return false;
+
+  // Avoid coins with similar % change (same momentum wave)
+  return Math.abs(existing.change - coin.change) < 1.5;
+});
+
+if (similar) continue;
 
       if (coin.change >= 1 && coin.change <= 5) {
         await pool.query(

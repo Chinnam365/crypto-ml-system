@@ -71,6 +71,16 @@ async function initDB() {
   }
 }
 
+// ===== RESET =====
+app.get('/reset', async (req, res) => {
+  await initDB();
+  await pool.query(`DELETE FROM positions`);
+  await pool.query(`DELETE FROM trades`);
+  await pool.query(`UPDATE portfolio SET capital=100 WHERE id=1`);
+  await pool.query(`UPDATE strategy_perf SET total_pnl=0`);
+  res.send("Reset complete");
+});
+
 // ===== VOLATILITY =====
 async function getVolatility(symbol) {
   try {
@@ -120,18 +130,17 @@ app.get('/', async (req, res) => {
     if (btcChange > 1) regime = "STRONG";
     else if (btcChange < -1) regime = "WEAK";
 
-    // ===== LOAD PERFORMANCE =====
+    // ===== LOAD STRATEGY PERFORMANCE =====
     const perf = await pool.query(`SELECT * FROM strategy_perf`);
     const mPerf = perf.rows.find(r => r.strategy === 'momentum').total_pnl;
     const cPerf = perf.rows.find(r => r.strategy === 'crash').total_pnl;
 
-    // normalize weights
     const totalPerf = Math.abs(mPerf) + Math.abs(cPerf) + 1;
 
     const momentumWeight = (mPerf + 1) / totalPerf;
     const crashWeight = (cPerf + 1) / totalPerf;
 
-    // ===== BUILD COINS =====
+    // ===== COINS =====
     const coins = response.data
       .filter(c => c.symbol.endsWith("USDT"))
       .map(c => ({
@@ -175,7 +184,13 @@ app.get('/', async (req, res) => {
       const value = p.quantity * coin.price;
       const pnl = (value - p.capital) / p.capital;
 
-      return { ...p, value, pnl, price: coin.price };
+      return {
+        ...p,
+        strategy: p.strategy || "momentum",
+        value,
+        pnl,
+        price: coin.price
+      };
     }).filter(Boolean);
 
     // ===== EXIT =====
@@ -186,11 +201,8 @@ app.get('/', async (req, res) => {
 
         portfolio.capital += pos.value;
 
-        // ===== LEARNING (PnL based) =====
         await pool.query(
-          `UPDATE strategy_perf
-           SET total_pnl = total_pnl + $1
-           WHERE strategy=$2`,
+          `UPDATE strategy_perf SET total_pnl = total_pnl + $1 WHERE strategy=$2`,
           [pos.pnl, pos.strategy]
         );
 
@@ -219,7 +231,13 @@ app.get('/', async (req, res) => {
       const value = p.quantity * coin.price;
       const pnl = (value - p.capital) / p.capital;
 
-      return { ...p, value, pnl, price: coin.price };
+      return {
+        ...p,
+        strategy: p.strategy || "momentum",
+        value,
+        pnl,
+        price: coin.price
+      };
     }).filter(Boolean);
 
     // ===== BUY =====
@@ -232,7 +250,6 @@ app.get('/', async (req, res) => {
 
       let allocation = portfolio.capital * 0.2 * (1 / (volatility + 0.01));
 
-      // strategy weighting
       if (coin.strategy === 'momentum') allocation *= (1 + momentumWeight);
       if (coin.strategy === 'crash') allocation *= (1 + crashWeight * 0.5);
 
@@ -249,6 +266,12 @@ app.get('/', async (req, res) => {
          VALUES ($1,$2,$3,$4,$5,'OPEN')`,
         [coin.symbol, coin.price, allocation, qty, coin.strategy]
       );
+
+      await pool.query(
+        `INSERT INTO trades(symbol, action, price, capital, strategy)
+         VALUES ($1,'BUY',$2,$3,$4)`,
+        [coin.symbol, coin.price, allocation, coin.strategy]
+      );
     }
 
     // ===== TOTAL =====
@@ -257,20 +280,33 @@ app.get('/', async (req, res) => {
 
     await pool.query(`UPDATE portfolio SET capital=$1 WHERE id=1`, [portfolio.capital]);
 
+    const trades = await pool.query(
+      `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
+    );
+
+    // ===== UI =====
     res.send(`
-      <body style="background:#0f172a;color:white;padding:20px">
+      <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
 
-      <h1>🧠 PnL Adaptive Engine</h1>
+      <h1>🧠 ML Portfolio Dashboard</h1>
 
-      <div>Total: €${total.toFixed(2)}</div>
-      <div>Cash: €${portfolio.capital.toFixed(2)}</div>
-      <div>BTC: ${btcChange.toFixed(2)}% (${regime})</div>
+      <div>💰 Total: €${total.toFixed(2)}</div>
+      <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>
+      <div>📊 BTC: ${btcChange.toFixed(2)}% (${regime})</div>
 
-      <h3>Momentum Perf: ${mPerf.toFixed(3)}</h3>
-      <h3>Crash Perf: ${cPerf.toFixed(3)}</h3>
+      <h3>Strategy Performance</h3>
+      <div>Momentum: ${mPerf.toFixed(4)}</div>
+      <div>Crash: ${cPerf.toFixed(4)}</div>
 
-      <h3>Positions (${enriched.length})</h3>
-      ${enriched.map(p => `<div>${p.symbol} (${p.strategy}) ${(p.pnl*100).toFixed(2)}%</div>`).join('')}
+      <h3>Open Positions (${enriched.length})</h3>
+      ${enriched.map(p =>
+        `<div>${p.symbol} | ${p.strategy} | Entry: ${p.entry_price.toFixed(4)} | PnL: ${(p.pnl*100).toFixed(2)}%</div>`
+      ).join('')}
+
+      <h3>Recent Trades</h3>
+      ${trades.rows.map(t =>
+        `<div>${t.action} ${t.symbol} (${t.strategy || ''}) ${(t.pnl || 0).toFixed(4)}</div>`
+      ).join('')}
 
       </body>
     `);

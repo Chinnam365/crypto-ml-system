@@ -167,27 +167,49 @@ app.get('/', async (req, res) => {
     }).filter(Boolean);
 
     // ===== AGGRESSIVE REBALANCING =====
-    for (let coin of top5) {
-      const alreadyHeld = enrichedPositions.find(p => p.symbol === coin.symbol);
-      if (alreadyHeld) continue;
+    // ===== AGGRESSIVE REBALANCING (FIXED) =====
+for (let coin of top5) {
+  const alreadyHeld = enrichedPositions.find(p => p.symbol === coin.symbol);
+  if (alreadyHeld) continue;
 
-      if (enrichedPositions.length < MAX_POSITIONS) {
-        // normal buy
-      } else {
-        // find worst position
-        let worst = enrichedPositions.reduce((a, b) => a.pnl < b.pnl ? a : b);
+  // Ensure space BEFORE buying
+  if (enrichedPositions.length >= MAX_POSITIONS) {
+    let worst = enrichedPositions.reduce((a, b) => a.pnl < b.pnl ? a : b);
 
-        // SELL worst
-        await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [worst.id]);
+    await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [worst.id]);
 
-        await pool.query(
-          `INSERT INTO trades(symbol, action, price, capital, pnl)
-           VALUES ($1,'SELL (REBALANCE)',$2,$3,$4)`,
-          [worst.symbol, worst.currentPrice, worst.capital, worst.pnl]
-        );
+    await pool.query(
+      `INSERT INTO trades(symbol, action, price, capital, pnl)
+       VALUES ($1,'SELL (REBALANCE)',$2,$3,$4)`,
+      [worst.symbol, worst.currentPrice, worst.capital, worst.pnl]
+    );
 
-        enrichedPositions = enrichedPositions.filter(p => p.id !== worst.id);
-      }
+    enrichedPositions = enrichedPositions.filter(p => p.id !== worst.id);
+  }
+
+  // Now safe to buy (guaranteed space)
+  const capitalPerTrade = 100 / MAX_POSITIONS;
+
+  await pool.query(
+    `INSERT INTO positions(symbol, entry_price, capital, status)
+     VALUES ($1,$2,$3,'OPEN')`,
+    [coin.symbol, coin.price, capitalPerTrade]
+  );
+
+  await pool.query(
+    `INSERT INTO trades(symbol, action, price, capital, change, score, volume)
+     VALUES ($1,'BUY',$2,$3,$4,$5,$6)`,
+    [coin.symbol, coin.price, capitalPerTrade, coin.change, coin.score, coin.volume]
+  );
+
+  enrichedPositions.push({
+    id: null,
+    symbol: coin.symbol,
+    entry_price: coin.price,
+    pnl: 0,
+    capital: capitalPerTrade
+  });
+}
 
       // BUY new coin
       const capitalPerTrade = 100 / MAX_POSITIONS;

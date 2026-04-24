@@ -15,7 +15,9 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS state (
       id INT PRIMARY KEY,
-      capital FLOAT
+      capital FLOAT,
+      position TEXT,
+      coin TEXT
     )
   `);
 
@@ -33,7 +35,10 @@ async function initDB() {
   const res = await pool.query(`SELECT * FROM state WHERE id=1`);
 
   if (res.rows.length === 0) {
-    await pool.query(`INSERT INTO state (id, capital) VALUES (1, 100)`);
+    await pool.query(
+      `INSERT INTO state (id, capital, position, coin)
+       VALUES (1, 100, 'NONE', NULL)`
+    );
   }
 }
 
@@ -42,9 +47,11 @@ app.get('/', async (req, res) => {
   try {
     await initDB();
 
-    // Get capital
+    // Get state
     const dbState = await pool.query(`SELECT * FROM state WHERE id=1`);
     let capital = dbState.rows[0].capital;
+    let position = dbState.rows[0].position;
+    let currentCoin = dbState.rows[0].coin;
 
     // Get recent trades
     const tradesResult = await pool.query(
@@ -70,7 +77,7 @@ app.get('/', async (req, res) => {
         change: parseFloat(c.priceChangePercent)
       }));
 
-    // Filter realistic moves
+    // Valid movement filter
     const validCoins = coins.filter(c =>
       Math.abs(c.change) > 1 && Math.abs(c.change) < 5
     );
@@ -81,13 +88,27 @@ app.get('/', async (req, res) => {
 
     let action = "HOLD";
 
-    // Decision logic
-    if (best.change > 1 && best.change < 5) {
-      capital *= 1.01;
-      action = "BUY";
-    } else if (best.change < -1 && best.change > -5) {
-      capital *= 0.99;
-      action = "SELL";
+    // ===== POSITION LOGIC =====
+
+    // If no position → BUY
+    if (position === "NONE") {
+      if (best.change > 1 && best.change < 5) {
+        capital *= 1.01;
+        action = "BUY";
+        position = "HOLDING";
+        currentCoin = best.symbol;
+      }
+    }
+
+    // If holding → SELL
+    else if (position === "HOLDING") {
+      // Only react to same coin
+      if (best.symbol === currentCoin && best.change < -1) {
+        capital *= 0.99;
+        action = "SELL";
+        position = "NONE";
+        currentCoin = null;
+      }
     }
 
     // Save trade
@@ -99,10 +120,10 @@ app.get('/', async (req, res) => {
       );
     }
 
-    // Update capital
+    // Update state
     await pool.query(
-      `UPDATE state SET capital=$1 WHERE id=1`,
-      [capital]
+      `UPDATE state SET capital=$1, position=$2, coin=$3 WHERE id=1`,
+      [capital, position, currentCoin]
     );
 
     // ===== UI =====
@@ -126,6 +147,7 @@ app.get('/', async (req, res) => {
           }
           .green { color: #22c55e; }
           .red { color: #ef4444; }
+          .yellow { color: #facc15; }
         </style>
       </head>
       <body>
@@ -137,13 +159,24 @@ app.get('/', async (req, res) => {
         </div>
 
         <div class="card">
-          <h3>📊 Selected Coin</h3>
+          <h3>📊 Market Signal</h3>
           <p><b>${best.symbol}</b></p>
           <p>Change: ${best.change.toFixed(2)}%</p>
-          <p>Action: 
-            <span class="${action === 'BUY' ? 'green' : action === 'SELL' ? 'red' : ''}">
-              ${action}
-            </span>
+        </div>
+
+        <div class="card">
+          <h3>📌 Position Status</h3>
+          <p>Position: ${position}</p>
+          <p>Holding Coin: ${currentCoin || "None"}</p>
+        </div>
+
+        <div class="card">
+          <h3>⚡ Action</h3>
+          <p class="${
+            action === 'BUY' ? 'green' :
+            action === 'SELL' ? 'red' : 'yellow'
+          }">
+            ${action}
           </p>
         </div>
 
@@ -167,7 +200,7 @@ app.get('/', async (req, res) => {
   }
 });
 
-// HISTORY API (keep this)
+// HISTORY API
 app.get('/history', async (req, res) => {
   try {
     const result = await pool.query(

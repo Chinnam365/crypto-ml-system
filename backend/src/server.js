@@ -74,13 +74,22 @@ app.get('/', async (req, res) => {
     let action = "HOLD";
 
     // Decision logic
-    if (best.change > 2) {
-      capital *= 1.01;
-      action = "BUY";
-    } else if (best.change < -2) {
-      capital *= 0.99;
-      action = "SELL";
-    }
+    let action = "HOLD";
+
+// ignore extreme spikes (already pumped)
+if (Math.abs(best.change) > 15) {
+  action = "HOLD";
+} 
+// moderate upward movement → BUY
+else if (best.change > 1 && best.change < 5) {
+  capital *= 1.01;
+  action = "BUY";
+} 
+// moderate drop → SELL
+else if (best.change < -1 && best.change > -5) {
+  capital *= 0.99;
+  action = "SELL";
+}
 
     // Save trade if executed
     if (action !== "HOLD") {

@@ -6,15 +6,14 @@ const app = express();
 let capital = 100;
 let lastPrices = {};
 
-app.get('/', async (req, res) => {
+// run logic every 10 seconds
+setInterval(async () => {
   try {
     const response = await axios.get(
       'https://api.binance.com/api/v3/ticker/24hr'
     );
 
-    let trades = [];
-
-    const coins = response.data.slice(0, 10).map(c => {
+    response.data.slice(0, 10).forEach(c => {
       const symbol = c.symbol;
       const price = parseFloat(c.lastPrice);
       const change = parseFloat(c.priceChangePercent);
@@ -24,43 +23,31 @@ app.get('/', async (req, res) => {
       if (change > 2) signal = "BUY";
       if (change < -2) signal = "SELL";
 
-      // if we have previous price → calculate real change
       if (lastPrices[symbol]) {
         const prev = lastPrices[symbol];
         const realChange = (price - prev) / prev;
 
         if (signal === "BUY") {
           capital *= (1 + realChange);
-          trades.push(`BUY ${symbol} → ${(realChange * 100).toFixed(2)}%`);
         }
 
         if (signal === "SELL") {
           capital *= (1 - realChange);
-          trades.push(`SELL ${symbol} → ${(realChange * 100).toFixed(2)}%`);
         }
       }
 
-      // update last price
       lastPrices[symbol] = price;
-
-      return {
-        symbol,
-        price,
-        change,
-        signal
-      };
     });
 
-    res.json({
-      message: "Realistic Paper Trading 🚀",
-      capital: capital.toFixed(2),
-      trades,
-      decisions: coins
-    });
+  } catch (e) {}
+}, 10000);
 
-  } catch (err) {
-    res.send("Error fetching data");
-  }
+// endpoint only shows result
+app.get('/', (req, res) => {
+  res.json({
+    message: "Live Paper Trading Running 🚀",
+    capital: capital.toFixed(2)
+  });
 });
 
 app.listen(3000, () => {

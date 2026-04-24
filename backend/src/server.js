@@ -11,7 +11,7 @@ const pool = new Pool({
 
 const MAX_POSITIONS = 5;
 
-// ===== INIT DB =====
+// ===== INIT DB + AUTO FIX =====
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS positions (
@@ -32,9 +32,6 @@ async function initDB() {
       price FLOAT,
       capital FLOAT,
       pnl FLOAT,
-      change FLOAT,
-      score FLOAT,
-      volume FLOAT,
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
@@ -45,6 +42,19 @@ async function initDB() {
       momentum FLOAT
     )
   `);
+
+  // AUTO ADD COLUMNS (SAFE)
+  const columns = [
+    "change FLOAT",
+    "score FLOAT",
+    "volume FLOAT"
+  ];
+
+  for (let col of columns) {
+    try {
+      await pool.query(`ALTER TABLE trades ADD COLUMN ${col}`);
+    } catch (e) {}
+  }
 
   const w = await pool.query(`SELECT * FROM weights WHERE id=1`);
   if (w.rows.length === 0) {
@@ -83,7 +93,7 @@ async function updateWeights() {
   );
 }
 
-// ===== MAIN =====
+// ===== MAIN DASHBOARD =====
 app.get('/', async (req, res) => {
   try {
     await initDB();
@@ -119,18 +129,18 @@ app.get('/', async (req, res) => {
 
     const top5 = scored.sort((a, b) => b.score - a.score).slice(0, 5);
 
-    const positions = (await pool.query(
+    let positions = (await pool.query(
       `SELECT * FROM positions WHERE status='OPEN'`
     )).rows;
 
-    let capitalPerTrade = 100 / MAX_POSITIONS;
+    const capitalPerTrade = 100 / MAX_POSITIONS;
 
     // ===== ENTRY =====
     for (let coin of top5) {
       if (positions.length >= MAX_POSITIONS) break;
 
-      const already = positions.find(p => p.symbol === coin.symbol);
-      if (already) continue;
+      const exists = positions.find(p => p.symbol === coin.symbol);
+      if (exists) continue;
 
       if (coin.change >= 1 && coin.change <= 5) {
         await pool.query(`
@@ -146,7 +156,7 @@ app.get('/', async (req, res) => {
     }
 
     // ===== EXIT =====
-    let updatedPositions = [];
+    let activePositions = [];
 
     for (let pos of positions) {
       const current = coins.find(c => c.symbol === pos.symbol);
@@ -155,9 +165,7 @@ app.get('/', async (req, res) => {
       const pnl = (current.price - pos.entry_price) / pos.entry_price;
 
       if (pnl >= 0.02 || pnl <= -0.01) {
-        await pool.query(`
-          UPDATE positions SET status='CLOSED' WHERE id=$1
-        `, [pos.id]);
+        await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
 
         await pool.query(`
           INSERT INTO trades(symbol, action, price, capital, pnl)
@@ -166,7 +174,7 @@ app.get('/', async (req, res) => {
 
         await updateWeights();
       } else {
-        updatedPositions.push({ ...pos, pnl });
+        activePositions.push({ ...pos, pnl });
       }
     }
 
@@ -177,31 +185,77 @@ app.get('/', async (req, res) => {
     // ===== UI =====
     res.send(`
       <html>
-      <body style="background:#0f172a;color:white;font-family:Arial;padding:20px">
+      <head>
+        <meta http-equiv="refresh" content="5">
+        <style>
+          body { background:#0f172a;color:white;font-family:Arial;padding:20px; }
+          .card { background:#1e293b;padding:15px;margin-bottom:10px;border-radius:8px; }
+        </style>
+      </head>
+      <body>
 
       <h1>🚀 Multi-Position ML Engine</h1>
 
-      <h2>Weights: ${weights.momentum.toFixed(2)}</h2>
+      <div class="card">
+        <h3>Weights</h3>
+        Momentum: ${weights.momentum.toFixed(2)}
+      </div>
 
-      <h3>📊 Top 5</h3>
-      <ul>
-        ${top5.map(c => `<li>${c.symbol} ${c.change.toFixed(2)}%</li>`).join('')}
-      </ul>
+      <div class="card">
+        <h3>Top 5 Coins</h3>
+        ${top5.map(c => `<div>${c.symbol} (${c.change.toFixed(2)}%)</div>`).join('')}
+      </div>
 
-      <h3>📌 Active Positions (${updatedPositions.length})</h3>
-      <ul>
-        ${updatedPositions.map(p => `
-          <li>${p.symbol} | Entry ${p.entry_price} | PnL ${(p.pnl*100).toFixed(2)}%</li>
+      <div class="card">
+        <h3>Active Positions (${activePositions.length})</h3>
+        ${activePositions.map(p => `
+          <div>${p.symbol} | Entry ${p.entry_price} | PnL ${(p.pnl*100).toFixed(2)}%</div>
         `).join('')}
-      </ul>
+      </div>
 
-      <h3>📜 Recent Trades</h3>
-      <ul>
+      <div class="card">
+        <h3>Recent Trades</h3>
         ${trades.map(t => `
-          <li>${t.action} ${t.symbol} (${t.pnl ? (t.pnl*100).toFixed(2)+'%' : ''})</li>
+          <div>${t.action} ${t.symbol} (${t.pnl ? (t.pnl*100).toFixed(2)+'%' : ''})</div>
         `).join('')}
-      </ul>
+      </div>
 
+      <a href="/history" style="color:lightblue">View Full History</a>
+
+      </body>
+      </html>
+    `);
+
+  } catch (err) {
+    res.send("Error: " + err.message);
+  }
+});
+
+// ===== HISTORY PAGE =====
+app.get('/history', async (req, res) => {
+  try {
+    await initDB();
+
+    const trades = (await pool.query(
+      `SELECT * FROM trades ORDER BY created_at DESC LIMIT 100`
+    )).rows;
+
+    res.send(`
+      <html>
+      <body style="background:#0f172a;color:white;font-family:Arial;padding:20px">
+      <h1>📜 Trade History</h1>
+
+      ${trades.map(t => `
+        <div style="margin-bottom:8px">
+          ${t.created_at} |
+          ${t.action} ${t.symbol} |
+          Price: ${t.price} |
+          Capital: ${t.capital}
+          ${t.pnl ? `| PnL: ${(t.pnl*100).toFixed(2)}%` : ''}
+        </div>
+      `).join('')}
+
+      <br><a href="/" style="color:lightblue">← Back</a>
       </body>
       </html>
     `);

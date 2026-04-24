@@ -47,22 +47,21 @@ async function initDB() {
   `);
 
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS strategy_stats (
+    CREATE TABLE IF NOT EXISTS strategy_perf (
       strategy TEXT PRIMARY KEY,
-      wins INT,
-      losses INT
+      total_pnl FLOAT
     )
   `);
 
   await pool.query(`
-    INSERT INTO strategy_stats(strategy, wins, losses)
-    VALUES ('momentum',0,0)
+    INSERT INTO strategy_perf(strategy, total_pnl)
+    VALUES ('momentum',0)
     ON CONFLICT DO NOTHING
   `);
 
   await pool.query(`
-    INSERT INTO strategy_stats(strategy, wins, losses)
-    VALUES ('crash',0,0)
+    INSERT INTO strategy_perf(strategy, total_pnl)
+    VALUES ('crash',0)
     ON CONFLICT DO NOTHING
   `);
 
@@ -121,6 +120,17 @@ app.get('/', async (req, res) => {
     if (btcChange > 1) regime = "STRONG";
     else if (btcChange < -1) regime = "WEAK";
 
+    // ===== LOAD PERFORMANCE =====
+    const perf = await pool.query(`SELECT * FROM strategy_perf`);
+    const mPerf = perf.rows.find(r => r.strategy === 'momentum').total_pnl;
+    const cPerf = perf.rows.find(r => r.strategy === 'crash').total_pnl;
+
+    // normalize weights
+    const totalPerf = Math.abs(mPerf) + Math.abs(cPerf) + 1;
+
+    const momentumWeight = (mPerf + 1) / totalPerf;
+    const crashWeight = (cPerf + 1) / totalPerf;
+
     // ===== BUILD COINS =====
     const coins = response.data
       .filter(c => c.symbol.endsWith("USDT"))
@@ -131,32 +141,23 @@ app.get('/', async (req, res) => {
         volume: parseFloat(c.quoteVolume)
       }));
 
-    // ===== STRATEGY STATS =====
-    const stats = await pool.query(`SELECT * FROM strategy_stats`);
-    const momentumStats = stats.rows.find(s => s.strategy === 'momentum');
-    const crashStats = stats.rows.find(s => s.strategy === 'crash');
-
-    const momentumWeight = (momentumStats.wins + 1) / (momentumStats.losses + 1);
-    const crashWeight = (crashStats.wins + 1) / (crashStats.losses + 1);
-
     // ===== MOMENTUM =====
     let momentumCoins = coins
       .filter(c => c.change > 1.5 && c.change < 5 && c.volume > 10000000)
-      .map(c => ({ ...c, score: momentumScore(c) * momentumWeight }))
+      .map(c => ({ ...c, score: momentumScore(c) * (1 + momentumWeight) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
 
     // ===== CRASH =====
     let crashCoins = coins
       .filter(c => c.change < -15 && c.volume > 20000000)
-      .map(c => ({ ...c, score: crashScore(c) * crashWeight }))
+      .map(c => ({ ...c, score: crashScore(c) * (1 + crashWeight) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 2);
 
-    // ===== REGIME ADJUST =====
     if (regime === "WEAK") {
       momentumCoins = [];
-      crashCoins = crashCoins.slice(0, 1); // minimal trading
+      crashCoins = crashCoins.slice(0, 1);
     }
 
     const candidates = [
@@ -185,12 +186,13 @@ app.get('/', async (req, res) => {
 
         portfolio.capital += pos.value;
 
-        // update learning
-        if (pos.pnl > 0) {
-          await pool.query(`UPDATE strategy_stats SET wins = wins + 1 WHERE strategy=$1`, [pos.strategy]);
-        } else {
-          await pool.query(`UPDATE strategy_stats SET losses = losses + 1 WHERE strategy=$1`, [pos.strategy]);
-        }
+        // ===== LEARNING (PnL based) =====
+        await pool.query(
+          `UPDATE strategy_perf
+           SET total_pnl = total_pnl + $1
+           WHERE strategy=$2`,
+          [pos.pnl, pos.strategy]
+        );
 
         await pool.query(
           `INSERT INTO trades(symbol, action, price, capital, pnl, strategy)
@@ -224,14 +226,15 @@ app.get('/', async (req, res) => {
     for (let coin of candidates) {
 
       if (enriched.find(p => p.symbol === coin.symbol)) continue;
-
       if (enriched.length >= MAX_POSITIONS) continue;
 
       const volatility = await getVolatility(coin.symbol);
 
       let allocation = portfolio.capital * 0.2 * (1 / (volatility + 0.01));
 
-      if (coin.strategy === 'crash') allocation *= 0.4;
+      // strategy weighting
+      if (coin.strategy === 'momentum') allocation *= (1 + momentumWeight);
+      if (coin.strategy === 'crash') allocation *= (1 + crashWeight * 0.5);
 
       if (regime === "WEAK") allocation *= 0.3;
 
@@ -257,14 +260,14 @@ app.get('/', async (req, res) => {
     res.send(`
       <body style="background:#0f172a;color:white;padding:20px">
 
-      <h1>🤖 Adaptive ML Engine</h1>
+      <h1>🧠 PnL Adaptive Engine</h1>
 
       <div>Total: €${total.toFixed(2)}</div>
       <div>Cash: €${portfolio.capital.toFixed(2)}</div>
       <div>BTC: ${btcChange.toFixed(2)}% (${regime})</div>
 
-      <h3>Momentum Weight: ${momentumWeight.toFixed(2)}</h3>
-      <h3>Crash Weight: ${crashWeight.toFixed(2)}</h3>
+      <h3>Momentum Perf: ${mPerf.toFixed(3)}</h3>
+      <h3>Crash Perf: ${cPerf.toFixed(3)}</h3>
 
       <h3>Positions (${enriched.length})</h3>
       ${enriched.map(p => `<div>${p.symbol} (${p.strategy}) ${(p.pnl*100).toFixed(2)}%</div>`).join('')}

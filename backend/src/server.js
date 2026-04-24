@@ -137,6 +137,19 @@ app.get('/', async (req, res) => {
 
     // ===== ENTRY =====
     for (let coin of top5) {
+  if (positions.length >= MAX_POSITIONS) break;
+
+  const exists = positions.find(p => p.symbol === coin.symbol);
+  if (exists) continue;
+
+  // 🚨 CORRELATION FILTER (simple)
+  const base = coin.symbol.replace("USDT", "");
+
+  const similar = positions.find(p =>
+    p.symbol.includes(base.substring(0, 3))
+  );
+
+  if (similar) continue;
       if (positions.length >= MAX_POSITIONS) break;
 
       const exists = positions.find(p => p.symbol === coin.symbol);

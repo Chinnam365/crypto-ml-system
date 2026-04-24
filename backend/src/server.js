@@ -9,7 +9,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// ===== INIT DB (AUTO FIXING) =====
+// ===== INIT DB =====
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS state (
@@ -21,7 +21,6 @@ async function initDB() {
     )
   `);
 
-  // Safe schema upgrades
   try { await pool.query(`ALTER TABLE state ADD COLUMN position TEXT`); } catch {}
   try { await pool.query(`ALTER TABLE state ADD COLUMN coin TEXT`); } catch {}
   try { await pool.query(`ALTER TABLE state ADD COLUMN entry_price FLOAT`); } catch {}
@@ -55,14 +54,17 @@ app.get('/', async (req, res) => {
     await initDB();
 
     const dbState = await pool.query(`SELECT * FROM state WHERE id=1`);
+
     let capital = dbState.rows[0].capital;
     let position = dbState.rows[0].position || "NONE";
     let currentCoin = dbState.rows[0].coin || null;
-    // Fix broken state (no entry price but holding)
-if (position === "HOLDING" && !entryPrice) {
-  position = "NONE";
-  currentCoin = null;
-}
+    let entryPrice = dbState.rows[0].entry_price || null;
+
+    // ✅ FIX: reset broken state
+    if (position === "HOLDING" && !entryPrice) {
+      position = "NONE";
+      currentCoin = null;
+    }
 
     const tradesResult = await pool.query(
       `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
@@ -113,7 +115,6 @@ if (position === "HOLDING" && !entryPrice) {
       if (current && entryPrice) {
         pnl = (current.price - entryPrice) / entryPrice;
 
-        // Take Profit
         if (pnl >= 0.02) {
           capital *= (1 + pnl);
           action = "SELL (TP)";
@@ -121,8 +122,6 @@ if (position === "HOLDING" && !entryPrice) {
           currentCoin = null;
           entryPrice = null;
         }
-
-        // Stop Loss
         else if (pnl <= -0.01) {
           capital *= (1 + pnl);
           action = "SELL (SL)";
@@ -180,7 +179,7 @@ if (position === "HOLDING" && !entryPrice) {
           <h3>📌 Position</h3>
           <p>Status: ${position}</p>
           <p>Coin: ${currentCoin || "None"}</p>
-          <p>Entry: ${entryPrice || "-"}</p>
+          <p>Entry: ${entryPrice ? entryPrice.toFixed(4) : "-"}</p>
           <p>PnL: ${(pnl * 100).toFixed(2)}%</p>
         </div>
 

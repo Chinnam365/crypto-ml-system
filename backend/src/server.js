@@ -94,11 +94,21 @@ app.get('/', async (req, res) => {
     );
 
     const coins = response.data
-      .filter(c =>
-        c.symbol.endsWith("USDT") &&
-        parseFloat(c.volume) > 1000000 &&
-        parseFloat(c.lastPrice) > 0
-      )
+  .filter(c => {
+    const symbol = c.symbol;
+
+    return (
+      symbol.endsWith("USDT") &&
+      parseFloat(c.volume) > 1000000 &&
+      parseFloat(c.lastPrice) > 0 &&
+
+      // ❌ Remove leveraged / risky tokens
+      !symbol.includes("UP") &&
+      !symbol.includes("DOWN") &&
+      !symbol.includes("BULL") &&
+      !symbol.includes("BEAR")
+    );
+  })
       .slice(0, 100)
       .map(c => ({
         symbol: c.symbol,

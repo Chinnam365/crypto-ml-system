@@ -53,11 +53,19 @@ app.get('/', async (req, res) => {
     );
 
     // Prepare coin data
-    const coins = response.data.slice(0, 20).map(c => ({
-      symbol: c.symbol,
-      price: parseFloat(c.lastPrice),
-      change: parseFloat(c.priceChangePercent)
-    }));
+    const coins = response.data
+  .filter(c =>
+    c.symbol.endsWith("USDT") &&              // only major pairs
+    parseFloat(c.volume) > 1000000 &&         // good liquidity
+    parseFloat(c.lastPrice) > 0               // valid price
+  )
+  .slice(0, 50)
+  .map(c => ({
+    symbol: c.symbol,
+    price: parseFloat(c.lastPrice),
+    change: parseFloat(c.priceChangePercent),
+    volume: parseFloat(c.volume)
+  }));
 
     // Select best opportunity (highest movement)
     const best = coins.sort((a, b) => Math.abs(b.change) - Math.abs(a.change))[0];

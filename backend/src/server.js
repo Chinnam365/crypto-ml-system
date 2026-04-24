@@ -4,7 +4,6 @@ const { Pool } = require('pg');
 
 const app = express();
 
-// ===== DB =====
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -52,7 +51,6 @@ async function initDB() {
     )
   `);
 
-  // seed
   const p = await pool.query(`SELECT * FROM portfolio WHERE id=1`);
   if (p.rows.length === 0) {
     await pool.query(`INSERT INTO portfolio VALUES (1, 100)`);
@@ -93,22 +91,17 @@ async function getVolatility(symbol) {
   }
 }
 
-// ===== SCORING =====
-function scoreCoin(c, momentumWeight) {
+// ===== SCORE =====
+function scoreCoin(c, weight) {
   if (c.change > 5 || c.change < -3) return -999;
-
   const stability = 1 - Math.abs(c.change) / 10;
-
-  return (c.change * momentumWeight * stability) + Math.log10(c.volume);
+  return (c.change * weight * stability) + Math.log10(c.volume);
 }
 
-// ===== MAIN ENGINE =====
+// ===== MAIN =====
 app.get('/', async (req, res) => {
 
-  // ===== EXECUTION LOCK =====
-  if (global.running) {
-    return res.send("Processing...");
-  }
+  if (global.running) return res.send("Processing...");
   global.running = true;
 
   try {
@@ -117,9 +110,27 @@ app.get('/', async (req, res) => {
     let portfolio = (await pool.query(`SELECT * FROM portfolio WHERE id=1`)).rows[0];
     const weights = (await pool.query(`SELECT * FROM weights WHERE id=1`)).rows[0];
 
-    // ===== FETCH MARKET =====
     const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr');
 
+    // ===== MARKET REGIME =====
+    const btc = response.data.find(c => c.symbol === "BTCUSDT");
+    const btcChange = parseFloat(btc.priceChangePercent);
+
+    if (btcChange < 1) {
+      global.running = false;
+      return res.send(`
+        <html>
+        <head><meta http-equiv="refresh" content="5"></head>
+        <body style="background:#0f172a;color:white;padding:20px">
+          <h1>⚠️ Market Weak — No Trading</h1>
+          <div>BTC Change: ${btcChange.toFixed(2)}%</div>
+          <div>Cash: €${portfolio.capital.toFixed(2)}</div>
+        </body>
+        </html>
+      `);
+    }
+
+    // ===== FILTER =====
     const coins = response.data
       .filter(c => {
         const price = parseFloat(c.lastPrice);
@@ -165,7 +176,7 @@ app.get('/', async (req, res) => {
       return { ...p, value, pnl, price: coin.price };
     }).filter(Boolean);
 
-    // ===== EXIT RULES =====
+    // ===== EXIT =====
     for (let pos of enriched) {
       if (pos.pnl >= 0.02 || pos.pnl <= -0.01) {
 
@@ -207,7 +218,6 @@ app.get('/', async (req, res) => {
 
       if (enriched.find(p => p.symbol === coin.symbol)) continue;
 
-      // remove worst if full
       if (enriched.length >= MAX_POSITIONS) {
         const worst = enriched.reduce((a, b) => a.pnl < b.pnl ? a : b);
 
@@ -224,18 +234,14 @@ app.get('/', async (req, res) => {
         enriched = enriched.filter(p => p.id !== worst.id);
       }
 
-      // ===== WEIGHT =====
       const weight = Math.max(coin.score, 0) / (totalScore || 1);
 
-      // ===== RISK CONTROL =====
       const volatility = await getVolatility(coin.symbol);
-
       const riskFactor = 1 / (volatility + 0.01);
       const normalizedRisk = Math.min(Math.max(riskFactor, 5), 50);
 
       let allocation = portfolio.capital * weight * (normalizedRisk / 10);
 
-      // cap risk
       if (allocation > portfolio.capital * 0.4) {
         allocation = portfolio.capital * 0.4;
       }
@@ -277,17 +283,16 @@ app.get('/', async (req, res) => {
       `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
     )).rows;
 
-    // ===== UI =====
     res.send(`
       <html>
       <head><meta http-equiv="refresh" content="5"></head>
       <body style="background:#0f172a;color:white;font-family:Arial;padding:20px">
 
-      <h1>🚀 ML Portfolio Engine (Stable + Risk Controlled)</h1>
+      <h1>🚀 ML Portfolio Engine (Risk + Regime)</h1>
 
       <div>💰 Total: €${totalValue.toFixed(2)}</div>
       <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>
-      <div>⚙️ Momentum: ${weights.momentum.toFixed(2)}</div>
+      <div>📊 BTC: ${btcChange.toFixed(2)}%</div>
 
       <h3>Top Coins</h3>
       ${top5.map(c => `<div>${c.symbol} (${c.change.toFixed(2)}%)</div>`).join('')}
@@ -309,5 +314,4 @@ app.get('/', async (req, res) => {
   global.running = false;
 });
 
-// ===== START =====
-app.listen(3000, () => console.log("Server running"));
+app.listen(3000);

@@ -19,7 +19,6 @@ async function initDB() {
       symbol TEXT,
       entry_price FLOAT,
       capital FLOAT,
-      quantity FLOAT,
       status TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     )
@@ -50,6 +49,12 @@ async function initDB() {
       momentum FLOAT
     )
   `);
+
+  // ===== AUTO FIX SCHEMA =====
+  try { await pool.query(`ALTER TABLE positions ADD COLUMN quantity FLOAT`); } catch (e) {}
+  try { await pool.query(`ALTER TABLE trades ADD COLUMN change FLOAT`); } catch (e) {}
+  try { await pool.query(`ALTER TABLE trades ADD COLUMN score FLOAT`); } catch (e) {}
+  try { await pool.query(`ALTER TABLE trades ADD COLUMN volume FLOAT`); } catch (e) {}
 
   // Init portfolio
   const p = await pool.query(`SELECT * FROM portfolio WHERE id=1`);
@@ -127,7 +132,7 @@ app.get('/', async (req, res) => {
         volume: parseFloat(c.volume)
       }));
 
-    // ===== SCORING =====
+    // ===== SCORE =====
     const scored = coins.map(c => ({
       ...c,
       score: scoreCoin(c, weights)
@@ -176,15 +181,14 @@ app.get('/', async (req, res) => {
       return { ...p, currentPrice: c.price, value, pnl };
     }).filter(Boolean);
 
-    // ===== HARD CAP SAFETY =====
+    // ===== HARD CAP =====
     while (enriched.length > MAX_POSITIONS) {
       let worst = enriched.reduce((a, b) => a.pnl < b.pnl ? a : b);
-
       await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [worst.id]);
       enriched = enriched.filter(p => p.id !== worst.id);
     }
 
-    // ===== EXIT RULES =====
+    // ===== EXIT =====
     for (let pos of enriched) {
       if (pos.pnl >= 0.02 || pos.pnl <= -0.01) {
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
@@ -216,12 +220,11 @@ app.get('/', async (req, res) => {
       return { ...p, currentPrice: c.price, value, pnl };
     }).filter(Boolean);
 
-    // ===== REBALANCING =====
+    // ===== REBALANCE =====
     for (let coin of top5) {
       const alreadyHeld = enriched.find(p => p.symbol === coin.symbol);
       if (alreadyHeld) continue;
 
-      // ensure space
       if (enriched.length >= MAX_POSITIONS) {
         let worst = enriched.reduce((a, b) => a.pnl < b.pnl ? a : b);
 
@@ -238,12 +241,10 @@ app.get('/', async (req, res) => {
         enriched = enriched.filter(p => p.id !== worst.id);
       }
 
-      // allocate
       const allocation = portfolio.capital / (MAX_POSITIONS - enriched.length || 1);
       if (allocation <= 0) break;
 
       const quantity = allocation / coin.price;
-
       portfolio.capital -= allocation;
 
       await pool.query(
@@ -273,45 +274,26 @@ app.get('/', async (req, res) => {
       `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
     )).rows;
 
-    // ===== UI =====
     res.send(`
       <html>
-      <head>
-        <meta http-equiv="refresh" content="5">
-        <style>
-          body { background:#0f172a;color:white;font-family:Arial;padding:20px; }
-          .card { background:#1e293b;padding:15px;margin-bottom:10px;border-radius:8px; }
-        </style>
-      </head>
-      <body>
+      <head><meta http-equiv="refresh" content="5"></head>
+      <body style="background:#0f172a;color:white;font-family:Arial;padding:20px">
 
       <h1>🚀 Integrated ML Portfolio Engine</h1>
 
-      <div class="card">
-        <b>Capital:</b> €${portfolio.capital.toFixed(2)} <br>
-        <b>Momentum Weight:</b> ${weights.momentum.toFixed(2)}
-      </div>
+      <div>💰 Capital: €${portfolio.capital.toFixed(2)}</div>
+      <div>⚙️ Momentum: ${weights.momentum.toFixed(2)}</div>
 
-      <div class="card">
-        <h3>Top Coins</h3>
-        ${top5.map(c => `<div>${c.symbol} (${c.change.toFixed(2)}%)</div>`).join('')}
-      </div>
+      <h3>Top Coins</h3>
+      ${top5.map(c => `<div>${c.symbol} (${c.change.toFixed(2)}%)</div>`).join('')}
 
-      <div class="card">
-        <h3>Positions (${enriched.length})</h3>
-        ${enriched.map(p => `
-          <div>${p.symbol} | ${(p.pnl*100).toFixed(2)}%</div>
-        `).join('')}
-      </div>
+      <h3>Positions (${enriched.length})</h3>
+      ${enriched.map(p => `<div>${p.symbol} | ${(p.pnl*100).toFixed(2)}%</div>`).join('')}
 
-      <div class="card">
-        <h3>Recent Trades</h3>
-        ${trades.map(t => `
-          <div>${t.action} ${t.symbol} ${t.pnl ? '('+(t.pnl*100).toFixed(2)+'%)' : ''}</div>
-        `).join('')}
-      </div>
+      <h3>Recent Trades</h3>
+      ${trades.map(t => `<div>${t.action} ${t.symbol} ${t.pnl ? '('+(t.pnl*100).toFixed(2)+'%)' : ''}</div>`).join('')}
 
-      <a href="/history" style="color:lightblue">History</a>
+      <br><a href="/history">History</a>
 
       </body>
       </html>

@@ -43,7 +43,6 @@ async function initDB() {
     )
   `);
 
-  // Auto-fix missing columns
   const cols = ["change FLOAT", "score FLOAT", "volume FLOAT"];
   for (let col of cols) {
     try {
@@ -126,10 +125,8 @@ app.get('/', async (req, res) => {
 
     // ===== DIVERSIFIED SELECTION =====
     const candidates = sorted.slice(0, 30);
-
     let top5 = [];
 
-    // Phase 1: strict diversification
     for (let coin of candidates) {
       if (top5.length >= 5) break;
 
@@ -142,13 +139,10 @@ app.get('/', async (req, res) => {
       }
     }
 
-    // Phase 2: fallback (ensure 5 coins)
     if (top5.length < 5) {
       for (let coin of candidates) {
         if (top5.length >= 5) break;
-
-        const exists = top5.find(c => c.symbol === coin.symbol);
-        if (!exists) {
+        if (!top5.find(c => c.symbol === coin.symbol)) {
           top5.push(coin);
         }
       }
@@ -158,13 +152,44 @@ app.get('/', async (req, res) => {
       `SELECT * FROM positions WHERE status='OPEN'`
     )).rows;
 
-    // ===== ENTRY =====
+    // ===== CALCULATE CURRENT PNL =====
+    let enrichedPositions = positions.map(p => {
+      const current = coins.find(c => c.symbol === p.symbol);
+      if (!current) return null;
+
+      const pnl = (current.price - p.entry_price) / p.entry_price;
+
+      return {
+        ...p,
+        pnl,
+        currentPrice: current.price
+      };
+    }).filter(Boolean);
+
+    // ===== AGGRESSIVE REBALANCING =====
     for (let coin of top5) {
-      if (positions.length >= MAX_POSITIONS) break;
+      const alreadyHeld = enrichedPositions.find(p => p.symbol === coin.symbol);
+      if (alreadyHeld) continue;
 
-      const exists = positions.find(p => p.symbol === coin.symbol);
-      if (exists) continue;
+      if (enrichedPositions.length < MAX_POSITIONS) {
+        // normal buy
+      } else {
+        // find worst position
+        let worst = enrichedPositions.reduce((a, b) => a.pnl < b.pnl ? a : b);
 
+        // SELL worst
+        await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [worst.id]);
+
+        await pool.query(
+          `INSERT INTO trades(symbol, action, price, capital, pnl)
+           VALUES ($1,'SELL (REBALANCE)',$2,$3,$4)`,
+          [worst.symbol, worst.currentPrice, worst.capital, worst.pnl]
+        );
+
+        enrichedPositions = enrichedPositions.filter(p => p.id !== worst.id);
+      }
+
+      // BUY new coin
       const capitalPerTrade = 100 / MAX_POSITIONS;
 
       await pool.query(
@@ -179,30 +204,29 @@ app.get('/', async (req, res) => {
         [coin.symbol, coin.price, capitalPerTrade, coin.change, coin.score, coin.volume]
       );
 
-      positions.push({ symbol: coin.symbol });
+      enrichedPositions.push({
+        symbol: coin.symbol,
+        entry_price: coin.price,
+        pnl: 0
+      });
     }
 
-    // ===== EXIT =====
+    // ===== EXIT RULES =====
     let activePositions = [];
 
-    for (let pos of positions) {
-      const current = coins.find(c => c.symbol === pos.symbol);
-      if (!current) continue;
-
-      const pnl = (current.price - pos.entry_price) / pos.entry_price;
-
-      if (pnl >= 0.02 || pnl <= -0.01) {
+    for (let pos of enrichedPositions) {
+      if (pos.pnl >= 0.02 || pos.pnl <= -0.01) {
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
 
         await pool.query(
           `INSERT INTO trades(symbol, action, price, capital, pnl)
            VALUES ($1,$2,$3,$4,$5)`,
-          [pos.symbol, pnl > 0 ? 'SELL (TP)' : 'SELL (SL)', current.price, pos.capital, pnl]
+          [pos.symbol, pos.pnl > 0 ? 'SELL (TP)' : 'SELL (SL)', pos.currentPrice, pos.capital, pos.pnl]
         );
 
         await updateWeights();
       } else {
-        activePositions.push({ ...pos, pnl });
+        activePositions.push(pos);
       }
     }
 
@@ -222,7 +246,7 @@ app.get('/', async (req, res) => {
       </head>
       <body>
 
-      <h1>🚀 Multi-Position ML Engine</h1>
+      <h1>🚀 Multi-Position ML Engine (Rebalancing)</h1>
 
       <div class="card">
         <h3>Weights</h3>
@@ -230,14 +254,14 @@ app.get('/', async (req, res) => {
       </div>
 
       <div class="card">
-        <h3>Top 5 (Diversified)</h3>
+        <h3>Top Coins</h3>
         ${top5.map(c => `<div>${c.symbol} (${c.change.toFixed(2)}%)</div>`).join('')}
       </div>
 
       <div class="card">
         <h3>Active Positions (${activePositions.length})</h3>
         ${activePositions.map(p => `
-          <div>${p.symbol} | Entry ${p.entry_price} | PnL ${(p.pnl*100).toFixed(2)}%</div>
+          <div>${p.symbol} | PnL ${(p.pnl*100).toFixed(2)}%</div>
         `).join('')}
       </div>
 
@@ -261,36 +285,11 @@ app.get('/', async (req, res) => {
 
 // ===== HISTORY =====
 app.get('/history', async (req, res) => {
-  try {
-    await initDB();
+  const trades = (await pool.query(
+    `SELECT * FROM trades ORDER BY created_at DESC LIMIT 100`
+  )).rows;
 
-    const trades = (await pool.query(
-      `SELECT * FROM trades ORDER BY created_at DESC LIMIT 100`
-    )).rows;
-
-    res.send(`
-      <html>
-      <body style="background:#0f172a;color:white;font-family:Arial;padding:20px">
-      <h1>📜 Trade History</h1>
-
-      ${trades.map(t => `
-        <div>
-          ${t.created_at} |
-          ${t.action} ${t.symbol} |
-          Price: ${t.price} |
-          Capital: ${t.capital}
-          ${t.pnl ? `| PnL: ${(t.pnl*100).toFixed(2)}%` : ''}
-        </div>
-      `).join('')}
-
-      <br><a href="/" style="color:lightblue">← Back</a>
-      </body>
-      </html>
-    `);
-
-  } catch (err) {
-    res.send("Error: " + err.message);
-  }
+  res.send(`<pre>${JSON.stringify(trades, null, 2)}</pre>`);
 });
 
 app.listen(3000);

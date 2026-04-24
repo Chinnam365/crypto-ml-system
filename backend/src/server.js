@@ -11,8 +11,9 @@ const pool = new Pool({
 
 const MAX_POSITIONS = 5;
 
-// ===== INIT =====
+// ===== INIT (SAFE FOR FREE DB) =====
 async function initDB() {
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS positions (
       id SERIAL PRIMARY KEY,
@@ -20,7 +21,6 @@ async function initDB() {
       entry_price FLOAT,
       capital FLOAT,
       quantity FLOAT,
-      strategy TEXT,
       status TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     )
@@ -34,7 +34,6 @@ async function initDB() {
       price FLOAT,
       capital FLOAT,
       pnl FLOAT,
-      strategy TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
@@ -61,6 +60,11 @@ async function initDB() {
     )
   `);
 
+  // ===== SAFE COLUMN ADD (KEY FIX) =====
+  await pool.query(`ALTER TABLE positions ADD COLUMN IF NOT EXISTS strategy TEXT`);
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy TEXT`);
+
+  // ===== INIT DATA =====
   await pool.query(`
     INSERT INTO strategy_perf(strategy, total_pnl)
     VALUES ('momentum',0)
@@ -139,10 +143,10 @@ app.get('/', async (req, res) => {
     if (btcChange > 1) regime = "STRONG";
     else if (btcChange < -1) regime = "WEAK";
 
-    // ===== STRATEGY PERFORMANCE =====
+    // ===== PERFORMANCE =====
     const perf = await pool.query(`SELECT * FROM strategy_perf`);
-    const mPerf = perf.rows.find(r => r.strategy === 'momentum').total_pnl;
-    const cPerf = perf.rows.find(r => r.strategy === 'crash').total_pnl;
+    const mPerf = perf.rows.find(r => r.strategy === 'momentum')?.total_pnl || 0;
+    const cPerf = perf.rows.find(r => r.strategy === 'crash')?.total_pnl || 0;
 
     const totalPerf = Math.abs(mPerf) + Math.abs(cPerf) + 1;
     const momentumWeight = (mPerf + 1) / totalPerf;
@@ -158,14 +162,13 @@ app.get('/', async (req, res) => {
         volume: parseFloat(c.quoteVolume)
       }));
 
-    // ===== MOMENTUM =====
+    // ===== STRATEGIES =====
     let momentumCoins = coins
       .filter(c => c.change > 1.5 && c.change < 5 && c.volume > 10000000)
       .map(c => ({ ...c, score: momentumScore(c) * (1 + momentumWeight) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
 
-    // ===== CRASH =====
     let crashCoins = coins
       .filter(c => c.change < -15 && c.volume > 20000000)
       .map(c => ({ ...c, score: crashScore(c) * (1 + crashWeight) }))
@@ -182,8 +185,14 @@ app.get('/', async (req, res) => {
       ...crashCoins.map(c => ({ ...c, strategy: 'crash' }))
     ];
 
-    // ===== LOAD POSITIONS =====
-    let positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
+    // ===== LOAD POSITIONS (SAFE SELECT) =====
+    let positions = (await pool.query(`
+      SELECT id, symbol, entry_price, capital, quantity,
+             COALESCE(strategy, 'momentum') as strategy,
+             status
+      FROM positions
+      WHERE status='OPEN'
+    `)).rows;
 
     let enriched = positions.map(p => {
       const coin = coins.find(c => c.symbol === p.symbol);
@@ -192,13 +201,7 @@ app.get('/', async (req, res) => {
       const value = p.quantity * coin.price;
       const pnl = (value - p.capital) / p.capital;
 
-      return {
-        ...p,
-        strategy: p.strategy || "momentum",
-        value,
-        pnl,
-        price: coin.price
-      };
+      return { ...p, value, pnl, price: coin.price };
     }).filter(Boolean);
 
     // ===== EXIT =====
@@ -228,8 +231,14 @@ app.get('/', async (req, res) => {
       }
     }
 
-    // refresh positions
-    positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
+    // refresh
+    positions = (await pool.query(`
+      SELECT id, symbol, entry_price, capital, quantity,
+             COALESCE(strategy, 'momentum') as strategy,
+             status
+      FROM positions
+      WHERE status='OPEN'
+    `)).rows;
 
     enriched = positions.map(p => {
       const coin = coins.find(c => c.symbol === p.symbol);
@@ -238,13 +247,7 @@ app.get('/', async (req, res) => {
       const value = p.quantity * coin.price;
       const pnl = (value - p.capital) / p.capital;
 
-      return {
-        ...p,
-        strategy: p.strategy || "momentum",
-        value,
-        pnl,
-        price: coin.price
-      };
+      return { ...p, value, pnl, price: coin.price };
     }).filter(Boolean);
 
     // ===== BUY =====
@@ -265,7 +268,6 @@ app.get('/', async (req, res) => {
       if (allocation < 5) continue;
 
       const qty = allocation / coin.price;
-
       portfolio.capital -= allocation;
 
       await pool.query(
@@ -287,74 +289,40 @@ app.get('/', async (req, res) => {
 
     await pool.query(`UPDATE portfolio SET capital=$1 WHERE id=1`, [portfolio.capital]);
 
-    // ===== STORE EQUITY =====
     await pool.query(`INSERT INTO equity(value) VALUES ($1)`, [total]);
 
-    // ===== LOAD ANALYTICS =====
-    const trades = await pool.query(
-      `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
-    );
+    const trades = await pool.query(`SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`);
+    const equity = await pool.query(`SELECT * FROM equity ORDER BY created_at ASC LIMIT 50`);
 
-    const equity = await pool.query(
-      `SELECT * FROM equity ORDER BY created_at ASC LIMIT 50`
-    );
-
-    const tradeStats = await pool.query(`
-      SELECT strategy,
-             COUNT(*) as count,
-             AVG(pnl) as avg_pnl
-      FROM trades
-      WHERE pnl IS NOT NULL
-      GROUP BY strategy
-    `);
-
-    // ===== UI =====
     res.send(`
       <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
+      <h1>📊 ML Dashboard</h1>
 
-      <h1>📊 ML Trading Dashboard</h1>
+      <div>Total: €${total.toFixed(2)}</div>
+      <div>Cash: €${portfolio.capital.toFixed(2)}</div>
+      <div>BTC: ${btcChange.toFixed(2)}% (${regime})</div>
 
-      <div>💰 Total: €${total.toFixed(2)}</div>
-      <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>
-      <div>📊 BTC: ${btcChange.toFixed(2)}% (${regime})</div>
+      <h3>Positions (${enriched.length})</h3>
+      ${enriched.map(p => `<div>${p.symbol} (${p.strategy}) ${(p.pnl*100).toFixed(2)}%</div>`).join('')}
 
-      <h2>Strategy Performance</h2>
-      <div>Momentum: ${mPerf.toFixed(4)}</div>
-      <div>Crash: ${cPerf.toFixed(4)}</div>
+      <h3>Recent Trades</h3>
+      ${trades.rows.map(t => `<div>${t.action} ${t.symbol}</div>`).join('')}
 
-      <h2>Positions (${enriched.length})</h2>
-      ${enriched.map(p =>
-        `<div>${p.symbol} | ${p.strategy} | Entry: ${p.entry_price.toFixed(4)} | PnL: ${(p.pnl*100).toFixed(2)}%</div>`
-      ).join('')}
-
-      <h2>Recent Trades</h2>
-      ${trades.rows.map(t =>
-        `<div>${t.action} ${t.symbol} (${t.strategy || ''}) ${(t.pnl || 0).toFixed(4)}</div>`
-      ).join('')}
-
-      <h2>Strategy Stats</h2>
-      ${tradeStats.rows.map(s =>
-        `<div>${s.strategy} → Trades: ${s.count} | Avg PnL: ${parseFloat(s.avg_pnl).toFixed(4)}</div>`
-      ).join('')}
-
-      <h2>Equity Curve</h2>
-      <canvas id="chart" width="300" height="150"></canvas>
+      <h3>Equity</h3>
+      <canvas id="chart"></canvas>
 
       <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
       <script>
-      const data = {
-        labels: ${JSON.stringify(equity.rows.map((_, i) => i))},
-        datasets: [{
-          label: 'Portfolio Value',
-          data: ${JSON.stringify(equity.rows.map(e => e.value))},
-          borderColor: 'lime',
-          fill: false
-        }]
-      };
-
       new Chart(document.getElementById('chart'), {
         type: 'line',
-        data: data
+        data: {
+          labels: ${JSON.stringify(equity.rows.map((_, i) => i))},
+          datasets: [{
+            label: 'Portfolio',
+            data: ${JSON.stringify(equity.rows.map(e => e.value))},
+            borderColor: 'lime'
+          }]
+        }
       });
       </script>
 

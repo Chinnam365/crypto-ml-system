@@ -3,8 +3,8 @@ const axios = require('axios');
 
 const app = express();
 
-// simple memory (will improve later)
 let capital = 100;
+let lastPrices = {};
 
 app.get('/', async (req, res) => {
   try {
@@ -15,6 +15,8 @@ app.get('/', async (req, res) => {
     let trades = [];
 
     const coins = response.data.slice(0, 10).map(c => {
+      const symbol = c.symbol;
+      const price = parseFloat(c.lastPrice);
       const change = parseFloat(c.priceChangePercent);
 
       let signal = "HOLD";
@@ -22,28 +24,37 @@ app.get('/', async (req, res) => {
       if (change > 2) signal = "BUY";
       if (change < -2) signal = "SELL";
 
-      // simulate simple trading
-      if (signal === "BUY") {
-        capital *= 1.01; // +1%
-        trades.push(`BUY ${c.symbol}`);
+      // if we have previous price → calculate real change
+      if (lastPrices[symbol]) {
+        const prev = lastPrices[symbol];
+        const realChange = (price - prev) / prev;
+
+        if (signal === "BUY") {
+          capital *= (1 + realChange);
+          trades.push(`BUY ${symbol} → ${(realChange * 100).toFixed(2)}%`);
+        }
+
+        if (signal === "SELL") {
+          capital *= (1 - realChange);
+          trades.push(`SELL ${symbol} → ${(realChange * 100).toFixed(2)}%`);
+        }
       }
 
-      if (signal === "SELL") {
-        capital *= 0.99; // -1%
-        trades.push(`SELL ${c.symbol}`);
-      }
+      // update last price
+      lastPrices[symbol] = price;
 
       return {
-        symbol: c.symbol,
-        change: change,
-        signal: signal
+        symbol,
+        price,
+        change,
+        signal
       };
     });
 
     res.json({
-      message: "Paper Trading Engine 🚀",
+      message: "Realistic Paper Trading 🚀",
       capital: capital.toFixed(2),
-      trades: trades,
+      trades,
       decisions: coins
     });
 

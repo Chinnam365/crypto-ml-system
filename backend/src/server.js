@@ -5,10 +5,13 @@ const { Pool } = require('pg');
 const app = express();
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
-// initialize tables
+// Initialize database
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS state (
@@ -35,57 +38,66 @@ async function initDB() {
   }
 }
 
+// MAIN ROUTE
 app.get('/', async (req, res) => {
   try {
     await initDB();
 
+    // Get capital
     const dbState = await pool.query(`SELECT * FROM state WHERE id=1`);
     let capital = dbState.rows[0].capital;
 
+    // Fetch market data
     const response = await axios.get(
       'https://api.binance.com/api/v3/ticker/24hr'
     );
 
+    // Prepare coin data
+    const coins = response.data.slice(0, 20).map(c => ({
+      symbol: c.symbol,
+      price: parseFloat(c.lastPrice),
+      change: parseFloat(c.priceChangePercent)
+    }));
+
+    // Select best opportunity (highest movement)
+    const best = coins.sort((a, b) => Math.abs(b.change) - Math.abs(a.change))[0];
+
     let tradesExecuted = [];
+    let action = "HOLD";
 
-    for (const c of response.data.slice(0, 10)) {
-      const symbol = c.symbol;
-      const price = parseFloat(c.lastPrice);
-      const change = parseFloat(c.priceChangePercent);
-
-      if (change > 2) {
-        capital *= 1.01;
-
-        await pool.query(
-          `INSERT INTO trades(symbol, action, price, capital)
-           VALUES ($1, $2, $3, $4)`,
-          [symbol, 'BUY', price, capital]
-        );
-
-        tradesExecuted.push(`BUY ${symbol}`);
-      }
-
-      if (change < -2) {
-        capital *= 0.99;
-
-        await pool.query(
-          `INSERT INTO trades(symbol, action, price, capital)
-           VALUES ($1, $2, $3, $4)`,
-          [symbol, 'SELL', price, capital]
-        );
-
-        tradesExecuted.push(`SELL ${symbol}`);
-      }
+    // Decision logic
+    if (best.change > 2) {
+      capital *= 1.01;
+      action = "BUY";
+    } else if (best.change < -2) {
+      capital *= 0.99;
+      action = "SELL";
     }
 
+    // Save trade if executed
+    if (action !== "HOLD") {
+      await pool.query(
+        `INSERT INTO trades(symbol, action, price, capital)
+         VALUES ($1, $2, $3, $4)`,
+        [best.symbol, action, best.price, capital]
+      );
+
+      tradesExecuted.push(`${action} ${best.symbol}`);
+    }
+
+    // Update capital
     await pool.query(
       `UPDATE state SET capital=$1 WHERE id=1`,
       [capital]
     );
 
+    // Response
     res.json({
-      message: "Trading + History Engine 🚀",
+      message: "Smart Trading Engine 🚀",
       capital: capital.toFixed(2),
+      selectedCoin: best.symbol,
+      change: best.change,
+      action: action,
       tradesExecuted
     });
 
@@ -94,13 +106,17 @@ app.get('/', async (req, res) => {
   }
 });
 
-// NEW: get trade history
+// TRADE HISTORY
 app.get('/history', async (req, res) => {
-  const result = await pool.query(
-    `SELECT * FROM trades ORDER BY created_at DESC LIMIT 20`
-  );
+  try {
+    const result = await pool.query(
+      `SELECT * FROM trades ORDER BY created_at DESC LIMIT 20`
+    );
 
-  res.json(result.rows);
+    res.json(result.rows);
+  } catch (err) {
+    res.send("Error: " + err.message);
+  }
 });
 
 app.listen(3000, () => {

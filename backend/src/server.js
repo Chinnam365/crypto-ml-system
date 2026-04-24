@@ -19,6 +19,7 @@ async function initDB() {
       symbol TEXT,
       entry_price FLOAT,
       capital FLOAT,
+      quantity FLOAT,
       status TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     )
@@ -50,12 +51,6 @@ async function initDB() {
     )
   `);
 
-  // AUTO FIX SCHEMA
-  try { await pool.query(`ALTER TABLE positions ADD COLUMN quantity FLOAT`); } catch {}
-  try { await pool.query(`ALTER TABLE trades ADD COLUMN change FLOAT`); } catch {}
-  try { await pool.query(`ALTER TABLE trades ADD COLUMN score FLOAT`); } catch {}
-  try { await pool.query(`ALTER TABLE trades ADD COLUMN volume FLOAT`); } catch {}
-
   const p = await pool.query(`SELECT * FROM portfolio WHERE id=1`);
   if (p.rows.length === 0) {
     await pool.query(`INSERT INTO portfolio VALUES (1, 100)`);
@@ -76,34 +71,37 @@ app.get('/reset', async (req, res) => {
   res.send("Reset complete");
 });
 
-// ===== SCORING =====
-function scoreCoin(c, w) {
-  if (c.change > 5 || c.change < -3) return -999;
-  return (c.change > 0 ? c.change : 0) * w.momentum + Math.log10(c.volume || 1);
+// ===== VOLATILITY =====
+async function getVolatility(symbol) {
+  try {
+    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=10`;
+    const res = await axios.get(url);
+
+    let total = 0;
+    res.data.forEach(c => {
+      const high = parseFloat(c[2]);
+      const low = parseFloat(c[3]);
+      total += (high - low) / low;
+    });
+
+    return total / res.data.length;
+  } catch {
+    return 0.02;
+  }
 }
 
-// ===== LEARNING =====
-async function updateWeights() {
-  const res = await pool.query(`
-    SELECT * FROM trades WHERE pnl IS NOT NULL
-    ORDER BY created_at DESC LIMIT 50
-  `);
-
-  if (res.rows.length < 10) return;
-
-  let win = 0, loss = 0;
-  res.rows.forEach(t => t.pnl > 0 ? win++ : loss++);
-
-  let newWeight = 1.2 + (win - loss) * 0.01;
-
-  await pool.query(
-    `UPDATE weights SET momentum=$1 WHERE id=1`,
-    [Math.max(0.5, Math.min(newWeight, 3))]
-  );
+// ===== SCORE =====
+function scoreCoin(c, weight) {
+  if (c.change > 5 || c.change < -3) return -999;
+  const stability = 1 - Math.abs(c.change) / 10;
+  return (c.change * weight * stability) + Math.log10(c.volume);
 }
 
 // ===== MAIN =====
 app.get('/', async (req, res) => {
+  if (global.isRunning) return res.send("Processing...");
+  global.isRunning = true;
+
   try {
     await initDB();
 
@@ -112,37 +110,36 @@ app.get('/', async (req, res) => {
 
     const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr');
 
-    // ===== FILTERED COINS (IMPROVED) =====
+    // ===== FILTER =====
     const coins = response.data
       .filter(c => {
         const price = parseFloat(c.lastPrice);
         const change = parseFloat(c.priceChangePercent);
-        const volume = parseFloat(c.quoteVolume || c.volume);
+        const volume = parseFloat(c.quoteVolume);
 
         return (
           c.symbol.endsWith("USDT") &&
-          price > 0.01 &&              // remove junk coins
-          volume > 5000000 &&         // strong liquidity
-          change > -3 && change < 5 &&// stable range
+          price > 0.05 &&
+          volume > 10000000 &&
+          change > 1.5 && change < 5 &&
           !c.symbol.includes("UP") &&
           !c.symbol.includes("DOWN")
         );
       })
-      .slice(0, 200)
       .map(c => ({
         symbol: c.symbol,
         price: parseFloat(c.lastPrice),
         change: parseFloat(c.priceChangePercent),
-        volume: parseFloat(c.quoteVolume || c.volume)
+        volume: parseFloat(c.quoteVolume)
       }));
 
+    // ===== SCORE =====
     const scored = coins.map(c => ({
       ...c,
-      score: scoreCoin(c, weights)
+      score: scoreCoin(c, weights.momentum)
     }));
 
-    const sorted = scored.sort((a, b) => b.score - a.score);
-    const top5 = sorted.slice(0, 5);
+    const top5 = scored.sort((a, b) => b.score - a.score).slice(0, 5);
 
     // ===== LOAD POSITIONS =====
     let positions = (await pool.query(
@@ -156,10 +153,10 @@ app.get('/', async (req, res) => {
       const value = p.quantity * c.price;
       const pnl = (value - p.capital) / p.capital;
 
-      return { ...p, value, pnl, currentPrice: c.price };
+      return { ...p, value, pnl, price: c.price };
     }).filter(Boolean);
 
-    // ===== EXIT RULES =====
+    // ===== EXIT =====
     for (let pos of enriched) {
       if (pos.pnl >= 0.02 || pos.pnl <= -0.01) {
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
@@ -169,14 +166,12 @@ app.get('/', async (req, res) => {
         await pool.query(
           `INSERT INTO trades(symbol, action, price, capital, pnl)
            VALUES ($1,$2,$3,$4,$5)`,
-          [pos.symbol, pos.pnl > 0 ? 'SELL (TP)' : 'SELL (SL)', pos.currentPrice, pos.value, pos.pnl]
+          [pos.symbol, pos.pnl > 0 ? 'SELL (TP)' : 'SELL (SL)', pos.price, pos.value, pos.pnl]
         );
-
-        await updateWeights();
       }
     }
 
-    // REFRESH
+    // refresh
     positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
 
     enriched = positions.map(p => {
@@ -186,16 +181,17 @@ app.get('/', async (req, res) => {
       const value = p.quantity * c.price;
       const pnl = (value - p.capital) / p.capital;
 
-      return { ...p, value, pnl, currentPrice: c.price };
+      return { ...p, value, pnl, price: c.price };
     }).filter(Boolean);
 
-    // ===== REBALANCE =====
+    // ===== REBALANCE + RISK CONTROL =====
+    const totalScore = top5.reduce((s, c) => s + Math.max(c.score, 0), 0);
+
     for (let coin of top5) {
-      const exists = enriched.find(p => p.symbol === coin.symbol);
-      if (exists) continue;
+      if (enriched.find(p => p.symbol === coin.symbol)) continue;
 
       if (enriched.length >= MAX_POSITIONS) {
-        let worst = enriched.reduce((a, b) => a.pnl < b.pnl ? a : b);
+        const worst = enriched.reduce((a, b) => a.pnl < b.pnl ? a : b);
 
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [worst.id]);
 
@@ -204,14 +200,26 @@ app.get('/', async (req, res) => {
         await pool.query(
           `INSERT INTO trades(symbol, action, price, capital, pnl)
            VALUES ($1,'SELL (REBALANCE)',$2,$3,$4)`,
-          [worst.symbol, worst.currentPrice, worst.value, worst.pnl]
+          [worst.symbol, worst.price, worst.value, worst.pnl]
         );
 
         enriched = enriched.filter(p => p.id !== worst.id);
       }
 
-      const allocation = portfolio.capital / (MAX_POSITIONS - enriched.length || 1);
-      if (allocation <= 0) break;
+      const weight = Math.max(coin.score, 0) / (totalScore || 1);
+
+      const volatility = await getVolatility(coin.symbol);
+      const riskFactor = 1 / (volatility + 0.01);
+      const normalizedRisk = Math.min(Math.max(riskFactor, 5), 50);
+
+      let allocation = portfolio.capital * weight * (normalizedRisk / 10);
+
+      // safety cap
+      if (allocation > portfolio.capital * 0.4) {
+        allocation = portfolio.capital * 0.4;
+      }
+
+      if (allocation < 5) continue;
 
       const quantity = allocation / coin.price;
 
@@ -231,14 +239,14 @@ app.get('/', async (req, res) => {
 
       enriched.push({
         symbol: coin.symbol,
-        capital: allocation,
         quantity,
+        capital: allocation,
         pnl: 0,
         value: allocation
       });
     }
 
-    // ===== TOTAL PORTFOLIO =====
+    // ===== TOTAL =====
     let totalValue = portfolio.capital;
     enriched.forEach(p => totalValue += p.value);
 
@@ -253,11 +261,10 @@ app.get('/', async (req, res) => {
       <head><meta http-equiv="refresh" content="5"></head>
       <body style="background:#0f172a;color:white;font-family:Arial;padding:20px">
 
-      <h1>🚀 ML Portfolio Engine (Improved)</h1>
+      <h1>🚀 ML Portfolio Engine (Risk Controlled)</h1>
 
-      <div>💰 Total Portfolio: €${totalValue.toFixed(2)}</div>
+      <div>💰 Total: €${totalValue.toFixed(2)}</div>
       <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>
-      <div>⚙️ Momentum: ${weights.momentum.toFixed(2)}</div>
 
       <h3>Top Coins</h3>
       ${top5.map(c => `<div>${c.symbol} (${c.change.toFixed(2)}%)</div>`).join('')}
@@ -265,7 +272,7 @@ app.get('/', async (req, res) => {
       <h3>Positions (${enriched.length})</h3>
       ${enriched.map(p => `<div>${p.symbol} | ${(p.pnl*100).toFixed(2)}%</div>`).join('')}
 
-      <h3>Recent Trades</h3>
+      <h3>Trades</h3>
       ${trades.map(t => `<div>${t.action} ${t.symbol}</div>`).join('')}
 
       </body>
@@ -275,6 +282,8 @@ app.get('/', async (req, res) => {
   } catch (err) {
     res.send("Error: " + err.message);
   }
+
+  global.isRunning = false;
 });
 
 app.listen(3000);

@@ -109,7 +109,7 @@ app.get('/', async (req, res) => {
           !s.includes("BEAR")
         );
       })
-      .slice(0, 100)
+      .slice(0, 200) // wider scan
       .map(c => ({
         symbol: c.symbol,
         price: parseFloat(c.lastPrice),
@@ -122,35 +122,36 @@ app.get('/', async (req, res) => {
       score: scoreCoin(c, weights)
     }));
 
-    const top5 = scored.sort((a, b) => b.score - a.score).slice(0, 5);
+    const sorted = scored.sort((a, b) => b.score - a.score);
+
+    // ===== DIVERSIFIED TOP 5 =====
+    const candidates = sorted.slice(0, 20);
+
+    let top5 = [];
+
+    for (let coin of candidates) {
+      if (top5.length >= 5) break;
+
+      const similar = top5.find(c =>
+        Math.abs(c.change - coin.change) < 1.5
+      );
+
+      if (!similar && coin.change >= 1 && coin.change <= 5) {
+        top5.push(coin);
+      }
+    }
 
     let positions = (await pool.query(
       `SELECT * FROM positions WHERE status='OPEN'`
     )).rows;
 
-    // ===== ENTRY (FIXED DIVERSIFICATION) =====
-    let selectedCoins = [];
-
+    // ===== ENTRY =====
     for (let coin of top5) {
-      if (positions.length + selectedCoins.length >= MAX_POSITIONS) break;
+      if (positions.length >= MAX_POSITIONS) break;
 
       const exists = positions.find(p => p.symbol === coin.symbol);
       if (exists) continue;
 
-      // Strong diversification (momentum separation)
-      const similar = selectedCoins.find(c =>
-        Math.abs(c.change - coin.change) < 1.5
-      );
-
-      if (similar) continue;
-
-      if (coin.change >= 1 && coin.change <= 5) {
-        selectedCoins.push(coin);
-      }
-    }
-
-    // Insert AFTER selection
-    for (let coin of selectedCoins) {
       const capitalPerTrade = 100 / MAX_POSITIONS;
 
       await pool.query(
@@ -164,12 +165,9 @@ app.get('/', async (req, res) => {
          VALUES ($1,'BUY',$2,$3,$4,$5,$6)`,
         [coin.symbol, coin.price, capitalPerTrade, coin.change, coin.score, coin.volume]
       );
-    }
 
-    // Refresh positions
-    positions = (await pool.query(
-      `SELECT * FROM positions WHERE status='OPEN'`
-    )).rows;
+      positions.push({ symbol: coin.symbol });
+    }
 
     // ===== EXIT =====
     let activePositions = [];
@@ -219,7 +217,7 @@ app.get('/', async (req, res) => {
       </div>
 
       <div class="card">
-        <h3>Top 5 Coins</h3>
+        <h3>Top 5 (Diversified)</h3>
         ${top5.map(c => `<div>${c.symbol} (${c.change.toFixed(2)}%)</div>`).join('')}
       </div>
 

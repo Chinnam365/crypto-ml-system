@@ -11,7 +11,7 @@ const pool = new Pool({
 
 const MAX_POSITIONS = 5;
 
-// ===== INIT DB + AUTO FIX =====
+// ===== INIT DB =====
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS positions (
@@ -43,14 +43,9 @@ async function initDB() {
     )
   `);
 
-  // AUTO ADD COLUMNS (SAFE)
-  const columns = [
-    "change FLOAT",
-    "score FLOAT",
-    "volume FLOAT"
-  ];
-
-  for (let col of columns) {
+  // SAFE schema updates
+  const cols = ["change FLOAT", "score FLOAT", "volume FLOAT"];
+  for (let col of cols) {
     try {
       await pool.query(`ALTER TABLE trades ADD COLUMN ${col}`);
     } catch (e) {}
@@ -93,7 +88,7 @@ async function updateWeights() {
   );
 }
 
-// ===== MAIN DASHBOARD =====
+// ===== MAIN =====
 app.get('/', async (req, res) => {
   try {
     await initDB();
@@ -135,36 +130,33 @@ app.get('/', async (req, res) => {
 
     const capitalPerTrade = 100 / MAX_POSITIONS;
 
-    // ===== ENTRY =====
+    // ===== ENTRY (WITH SAFE DIVERSIFICATION) =====
     for (let coin of top5) {
-  if (positions.length >= MAX_POSITIONS) break;
-
-  const exists = positions.find(p => p.symbol === coin.symbol);
-  if (exists) continue;
-
-  // 🚨 CORRELATION FILTER (simple)
-  const base = coin.symbol.replace("USDT", "");
-
-  const similar = positions.find(p =>
-    p.symbol.includes(base.substring(0, 3))
-  );
-
-  if (similar) continue;
       if (positions.length >= MAX_POSITIONS) break;
 
       const exists = positions.find(p => p.symbol === coin.symbol);
       if (exists) continue;
 
-      if (coin.change >= 1 && coin.change <= 5) {
-        await pool.query(`
-          INSERT INTO positions(symbol, entry_price, capital, status)
-          VALUES ($1,$2,$3,'OPEN')
-        `, [coin.symbol, coin.price, capitalPerTrade]);
+      // SIMPLE diversification (avoid same starting letter cluster)
+      const prefix = coin.symbol.substring(0, 3);
+      const similar = positions.find(p => p.symbol.substring(0, 3) === prefix);
+      if (similar) continue;
 
-        await pool.query(`
-          INSERT INTO trades(symbol, action, price, capital, change, score, volume)
-          VALUES ($1,'BUY',$2,$3,$4,$5,$6)
-        `, [coin.symbol, coin.price, capitalPerTrade, coin.change, coin.score, coin.volume]);
+      if (coin.change >= 1 && coin.change <= 5) {
+        await pool.query(
+          `INSERT INTO positions(symbol, entry_price, capital, status)
+           VALUES ($1,$2,$3,'OPEN')`,
+          [coin.symbol, coin.price, capitalPerTrade]
+        );
+
+        await pool.query(
+          `INSERT INTO trades(symbol, action, price, capital, change, score, volume)
+           VALUES ($1,'BUY',$2,$3,$4,$5,$6)`,
+          [coin.symbol, coin.price, capitalPerTrade, coin.change, coin.score, coin.volume]
+        );
+
+        // update local positions array
+        positions.push({ symbol: coin.symbol });
       }
     }
 
@@ -180,10 +172,11 @@ app.get('/', async (req, res) => {
       if (pnl >= 0.02 || pnl <= -0.01) {
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
 
-        await pool.query(`
-          INSERT INTO trades(symbol, action, price, capital, pnl)
-          VALUES ($1,$2,$3,$4,$5)
-        `, [pos.symbol, pnl > 0 ? 'SELL (TP)' : 'SELL (SL)', current.price, pos.capital, pnl]);
+        await pool.query(
+          `INSERT INTO trades(symbol, action, price, capital, pnl)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [pos.symbol, pnl > 0 ? 'SELL (TP)' : 'SELL (SL)', current.price, pos.capital, pnl]
+        );
 
         await updateWeights();
       } else {
@@ -229,7 +222,7 @@ app.get('/', async (req, res) => {
       <div class="card">
         <h3>Recent Trades</h3>
         ${trades.map(t => `
-          <div>${t.action} ${t.symbol} (${t.pnl ? (t.pnl*100).toFixed(2)+'%' : ''})</div>
+          <div>${t.action} ${t.symbol} ${t.pnl ? '('+(t.pnl*100).toFixed(2)+'%)' : ''}</div>
         `).join('')}
       </div>
 
@@ -244,7 +237,7 @@ app.get('/', async (req, res) => {
   }
 });
 
-// ===== HISTORY PAGE =====
+// ===== HISTORY =====
 app.get('/history', async (req, res) => {
   try {
     await initDB();
@@ -259,7 +252,7 @@ app.get('/history', async (req, res) => {
       <h1>📜 Trade History</h1>
 
       ${trades.map(t => `
-        <div style="margin-bottom:8px">
+        <div>
           ${t.created_at} |
           ${t.action} ${t.symbol} |
           Price: ${t.price} |

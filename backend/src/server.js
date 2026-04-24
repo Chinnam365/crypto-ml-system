@@ -9,7 +9,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// ===== INIT DB =====
+// ===== INIT DB (AUTO FIXING) =====
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS state (
@@ -21,7 +21,7 @@ async function initDB() {
     )
   `);
 
-  // Safe upgrades
+  // Safe schema upgrades
   try { await pool.query(`ALTER TABLE state ADD COLUMN position TEXT`); } catch {}
   try { await pool.query(`ALTER TABLE state ADD COLUMN coin TEXT`); } catch {}
   try { await pool.query(`ALTER TABLE state ADD COLUMN entry_price FLOAT`); } catch {}
@@ -37,6 +37,8 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
+
+  try { await pool.query(`ALTER TABLE trades ADD COLUMN pnl FLOAT`); } catch {}
 
   const res = await pool.query(`SELECT * FROM state WHERE id=1`);
   if (res.rows.length === 0) {
@@ -54,9 +56,9 @@ app.get('/', async (req, res) => {
 
     const dbState = await pool.query(`SELECT * FROM state WHERE id=1`);
     let capital = dbState.rows[0].capital;
-    let position = dbState.rows[0].position;
-    let currentCoin = dbState.rows[0].coin;
-    let entryPrice = dbState.rows[0].entry_price;
+    let position = dbState.rows[0].position || "NONE";
+    let currentCoin = dbState.rows[0].coin || null;
+    let entryPrice = dbState.rows[0].entry_price || null;
 
     const tradesResult = await pool.query(
       `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
@@ -104,10 +106,10 @@ app.get('/', async (req, res) => {
     else if (position === "HOLDING") {
       const current = coins.find(c => c.symbol === currentCoin);
 
-      if (current) {
+      if (current && entryPrice) {
         pnl = (current.price - entryPrice) / entryPrice;
 
-        // Take Profit +2%
+        // Take Profit
         if (pnl >= 0.02) {
           capital *= (1 + pnl);
           action = "SELL (TP)";
@@ -116,7 +118,7 @@ app.get('/', async (req, res) => {
           entryPrice = null;
         }
 
-        // Stop Loss -1%
+        // Stop Loss
         else if (pnl <= -0.01) {
           capital *= (1 + pnl);
           action = "SELL (SL)";
@@ -136,6 +138,7 @@ app.get('/', async (req, res) => {
       );
     }
 
+    // Update state
     await pool.query(
       `UPDATE state SET capital=$1, position=$2, coin=$3, entry_price=$4 WHERE id=1`,
       [capital, position, currentCoin, entryPrice]
@@ -189,7 +192,10 @@ app.get('/', async (req, res) => {
           <h3>📜 Recent Trades</h3>
           <ul>
             ${tradesResult.rows.map(t => `
-              <li>${t.action} ${t.symbol} → €${Number(t.capital).toFixed(2)} (${(t.pnl*100).toFixed(2)}%)</li>
+              <li>
+                ${t.action} ${t.symbol} → €${Number(t.capital).toFixed(2)}
+                (${t.pnl ? (t.pnl * 100).toFixed(2) : 0}%)
+              </li>
             `).join('')}
           </ul>
         </div>
@@ -205,7 +211,9 @@ app.get('/', async (req, res) => {
 
 // HISTORY
 app.get('/history', async (req, res) => {
-  const result = await pool.query(`SELECT * FROM trades ORDER BY created_at DESC LIMIT 20`);
+  const result = await pool.query(
+    `SELECT * FROM trades ORDER BY created_at DESC LIMIT 20`
+  );
   res.json(result.rows);
 });
 

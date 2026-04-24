@@ -11,7 +11,7 @@ const pool = new Pool({
 
 const MAX_POSITIONS = 5;
 
-// ===== INIT DB =====
+// ===== INIT =====
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS positions (
@@ -20,6 +20,7 @@ async function initDB() {
       entry_price FLOAT,
       capital FLOAT,
       quantity FLOAT,
+      strategy TEXT,
       status TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     )
@@ -33,6 +34,7 @@ async function initDB() {
       price FLOAT,
       capital FLOAT,
       pnl FLOAT,
+      strategy TEXT,
       created_at TIMESTAMP DEFAULT NOW()
     )
   `);
@@ -44,20 +46,31 @@ async function initDB() {
     )
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS strategy_stats (
+      strategy TEXT PRIMARY KEY,
+      wins INT,
+      losses INT
+    )
+  `);
+
+  await pool.query(`
+    INSERT INTO strategy_stats(strategy, wins, losses)
+    VALUES ('momentum',0,0)
+    ON CONFLICT DO NOTHING
+  `);
+
+  await pool.query(`
+    INSERT INTO strategy_stats(strategy, wins, losses)
+    VALUES ('crash',0,0)
+    ON CONFLICT DO NOTHING
+  `);
+
   const p = await pool.query(`SELECT * FROM portfolio WHERE id=1`);
   if (p.rows.length === 0) {
     await pool.query(`INSERT INTO portfolio VALUES (1, 100)`);
   }
 }
-
-// ===== RESET =====
-app.get('/reset', async (req, res) => {
-  await initDB();
-  await pool.query(`DELETE FROM positions`);
-  await pool.query(`DELETE FROM trades`);
-  await pool.query(`UPDATE portfolio SET capital=100 WHERE id=1`);
-  res.send("Reset complete");
-});
 
 // ===== VOLATILITY =====
 async function getVolatility(symbol) {
@@ -79,10 +92,9 @@ async function getVolatility(symbol) {
   }
 }
 
-// ===== SCORING =====
+// ===== SCORES =====
 function momentumScore(c) {
-  const stability = 1 - Math.abs(c.change) / 10;
-  return (c.change * stability) + Math.log10(c.volume);
+  return c.change + Math.log10(c.volume);
 }
 
 function crashScore(c) {
@@ -102,23 +114,15 @@ app.get('/', async (req, res) => {
 
     const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr');
 
-    // ===== BTC REGIME =====
     const btc = response.data.find(c => c.symbol === "BTCUSDT");
     const btcChange = parseFloat(btc.priceChangePercent);
 
-    if (btcChange < 0) {
-      global.running = false;
-      return res.send(`
-        <body style="background:#0f172a;color:white;padding:20px">
-        <h1>⚠️ Market Weak — No Trading</h1>
-        <div>BTC: ${btcChange.toFixed(2)}%</div>
-        <div>Cash: €${portfolio.capital.toFixed(2)}</div>
-        </body>
-      `);
-    }
+    let regime = "NEUTRAL";
+    if (btcChange > 1) regime = "STRONG";
+    else if (btcChange < -1) regime = "WEAK";
 
     // ===== BUILD COINS =====
-    const allCoins = response.data
+    const coins = response.data
       .filter(c => c.symbol.endsWith("USDT"))
       .map(c => ({
         symbol: c.symbol,
@@ -127,36 +131,44 @@ app.get('/', async (req, res) => {
         volume: parseFloat(c.quoteVolume)
       }));
 
+    // ===== STRATEGY STATS =====
+    const stats = await pool.query(`SELECT * FROM strategy_stats`);
+    const momentumStats = stats.rows.find(s => s.strategy === 'momentum');
+    const crashStats = stats.rows.find(s => s.strategy === 'crash');
+
+    const momentumWeight = (momentumStats.wins + 1) / (momentumStats.losses + 1);
+    const crashWeight = (crashStats.wins + 1) / (crashStats.losses + 1);
+
     // ===== MOMENTUM =====
-    const momentumCoins = allCoins
-      .filter(c =>
-        c.price > 0.05 &&
-        c.volume > 10000000 &&
-        c.change > 1.5 && c.change < 5
-      )
-      .map(c => ({ ...c, score: momentumScore(c) }))
+    let momentumCoins = coins
+      .filter(c => c.change > 1.5 && c.change < 5 && c.volume > 10000000)
+      .map(c => ({ ...c, score: momentumScore(c) * momentumWeight }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
 
     // ===== CRASH =====
-    const crashCoins = allCoins
-      .filter(c =>
-        c.change < -15 &&
-        c.volume > 20000000
-      )
-      .map(c => ({ ...c, score: crashScore(c) }))
+    let crashCoins = coins
+      .filter(c => c.change < -15 && c.volume > 20000000)
+      .map(c => ({ ...c, score: crashScore(c) * crashWeight }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 2);
 
-    const candidates = [...momentumCoins, ...crashCoins];
+    // ===== REGIME ADJUST =====
+    if (regime === "WEAK") {
+      momentumCoins = [];
+      crashCoins = crashCoins.slice(0, 1); // minimal trading
+    }
+
+    const candidates = [
+      ...momentumCoins.map(c => ({ ...c, strategy: 'momentum' })),
+      ...crashCoins.map(c => ({ ...c, strategy: 'crash' }))
+    ];
 
     // ===== LOAD POSITIONS =====
-    let positions = (await pool.query(
-      `SELECT * FROM positions WHERE status='OPEN'`
-    )).rows;
+    let positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
 
     let enriched = positions.map(p => {
-      const coin = allCoins.find(c => c.symbol === p.symbol);
+      const coin = coins.find(c => c.symbol === p.symbol);
       if (!coin) return null;
 
       const value = p.quantity * coin.price;
@@ -168,18 +180,28 @@ app.get('/', async (req, res) => {
     // ===== EXIT =====
     for (let pos of enriched) {
       if (pos.pnl >= 0.03 || pos.pnl <= -0.015) {
+
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
+
         portfolio.capital += pos.value;
 
+        // update learning
+        if (pos.pnl > 0) {
+          await pool.query(`UPDATE strategy_stats SET wins = wins + 1 WHERE strategy=$1`, [pos.strategy]);
+        } else {
+          await pool.query(`UPDATE strategy_stats SET losses = losses + 1 WHERE strategy=$1`, [pos.strategy]);
+        }
+
         await pool.query(
-          `INSERT INTO trades(symbol, action, price, capital, pnl)
-           VALUES ($1,$2,$3,$4,$5)`,
+          `INSERT INTO trades(symbol, action, price, capital, pnl, strategy)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
           [
             pos.symbol,
             pos.pnl > 0 ? 'SELL (TP)' : 'SELL (SL)',
             pos.price,
             pos.value,
-            pos.pnl
+            pos.pnl,
+            pos.strategy
           ]
         );
       }
@@ -189,7 +211,7 @@ app.get('/', async (req, res) => {
     positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
 
     enriched = positions.map(p => {
-      const coin = allCoins.find(c => c.symbol === p.symbol);
+      const coin = coins.find(c => c.symbol === p.symbol);
       if (!coin) return null;
 
       const value = p.quantity * coin.price;
@@ -198,54 +220,32 @@ app.get('/', async (req, res) => {
       return { ...p, value, pnl, price: coin.price };
     }).filter(Boolean);
 
-    // ===== BUY / REBALANCE =====
+    // ===== BUY =====
     for (let coin of candidates) {
 
       if (enriched.find(p => p.symbol === coin.symbol)) continue;
 
-      if (enriched.length >= MAX_POSITIONS) {
-        const worst = enriched.reduce((a, b) => a.pnl < b.pnl ? a : b);
-
-        await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [worst.id]);
-        portfolio.capital += worst.value;
-
-        enriched = enriched.filter(p => p.id !== worst.id);
-      }
+      if (enriched.length >= MAX_POSITIONS) continue;
 
       const volatility = await getVolatility(coin.symbol);
-      const riskFactor = 1 / (volatility + 0.01);
 
-      let allocation = portfolio.capital * 0.2 * (riskFactor / 10);
+      let allocation = portfolio.capital * 0.2 * (1 / (volatility + 0.01));
 
-      // smaller for crash trades
-      if (coin.change < -15) {
-        allocation *= 0.4;
-      }
+      if (coin.strategy === 'crash') allocation *= 0.4;
+
+      if (regime === "WEAK") allocation *= 0.3;
 
       if (allocation < 5) continue;
 
       const qty = allocation / coin.price;
+
       portfolio.capital -= allocation;
 
       await pool.query(
-        `INSERT INTO positions(symbol, entry_price, capital, quantity, status)
-         VALUES ($1,$2,$3,$4,'OPEN')`,
-        [coin.symbol, coin.price, allocation, qty]
+        `INSERT INTO positions(symbol, entry_price, capital, quantity, strategy, status)
+         VALUES ($1,$2,$3,$4,$5,'OPEN')`,
+        [coin.symbol, coin.price, allocation, qty, coin.strategy]
       );
-
-      await pool.query(
-        `INSERT INTO trades(symbol, action, price, capital)
-         VALUES ($1,'BUY',$2,$3)`,
-        [coin.symbol, coin.price, allocation]
-      );
-
-      enriched.push({
-        symbol: coin.symbol,
-        capital: allocation,
-        quantity: qty,
-        pnl: 0,
-        value: allocation
-      });
     }
 
     // ===== TOTAL =====
@@ -254,30 +254,20 @@ app.get('/', async (req, res) => {
 
     await pool.query(`UPDATE portfolio SET capital=$1 WHERE id=1`, [portfolio.capital]);
 
-    const trades = (await pool.query(
-      `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
-    )).rows;
-
     res.send(`
-      <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
+      <body style="background:#0f172a;color:white;padding:20px">
 
-      <h1>🚀 ML Dual Strategy Engine</h1>
+      <h1>🤖 Adaptive ML Engine</h1>
 
-      <div>💰 Total: €${total.toFixed(2)}</div>
-      <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>
-      <div>📊 BTC: ${btcChange.toFixed(2)}%</div>
+      <div>Total: €${total.toFixed(2)}</div>
+      <div>Cash: €${portfolio.capital.toFixed(2)}</div>
+      <div>BTC: ${btcChange.toFixed(2)}% (${regime})</div>
 
-      <h3>Momentum</h3>
-      ${momentumCoins.map(c => `<div>${c.symbol} (${c.change.toFixed(2)}%)</div>`).join('')}
-
-      <h3>Crash Recovery</h3>
-      ${crashCoins.map(c => `<div>${c.symbol} (${c.change.toFixed(2)}%)</div>`).join('')}
+      <h3>Momentum Weight: ${momentumWeight.toFixed(2)}</h3>
+      <h3>Crash Weight: ${crashWeight.toFixed(2)}</h3>
 
       <h3>Positions (${enriched.length})</h3>
-      ${enriched.map(p => `<div>${p.symbol} | ${(p.pnl*100).toFixed(2)}%</div>`).join('')}
-
-      <h3>Trades</h3>
-      ${trades.map(t => `<div>${t.action} ${t.symbol}</div>`).join('')}
+      ${enriched.map(p => `<div>${p.symbol} (${p.strategy}) ${(p.pnl*100).toFixed(2)}%</div>`).join('')}
 
       </body>
     `);

@@ -125,21 +125,36 @@ app.get('/', async (req, res) => {
     const sorted = scored.sort((a, b) => b.score - a.score);
 
     // ===== DIVERSIFIED TOP 5 =====
-    const candidates = sorted.slice(0, 20);
+    const sorted = scored.sort((a, b) => b.score - a.score);
 
-    let top5 = [];
+// Step 1: try strict diversification
+const candidates = sorted.slice(0, 30);
 
-    for (let coin of candidates) {
-      if (top5.length >= 5) break;
+let top5 = [];
 
-      const similar = top5.find(c =>
-        Math.abs(c.change - coin.change) < 1.5
-      );
+for (let coin of candidates) {
+  if (top5.length >= 5) break;
 
-      if (!similar && coin.change >= 1 && coin.change <= 5) {
-        top5.push(coin);
-      }
+  const similar = top5.find(c =>
+    Math.abs(c.change - coin.change) < 1.5
+  );
+
+  if (!similar && coin.change >= 1 && coin.change <= 5) {
+    top5.push(coin);
+  }
+}
+
+// Step 2: fallback (fill remaining slots)
+if (top5.length < 5) {
+  for (let coin of candidates) {
+    if (top5.length >= 5) break;
+
+    const exists = top5.find(c => c.symbol === coin.symbol);
+    if (!exists) {
+      top5.push(coin);
     }
+  }
+}
 
     let positions = (await pool.query(
       `SELECT * FROM positions WHERE status='OPEN'`

@@ -54,6 +54,14 @@ async function initDB() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS equity (
+      id SERIAL PRIMARY KEY,
+      value FLOAT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
     INSERT INTO strategy_perf(strategy, total_pnl)
     VALUES ('momentum',0)
     ON CONFLICT DO NOTHING
@@ -76,6 +84,7 @@ app.get('/reset', async (req, res) => {
   await initDB();
   await pool.query(`DELETE FROM positions`);
   await pool.query(`DELETE FROM trades`);
+  await pool.query(`DELETE FROM equity`);
   await pool.query(`UPDATE portfolio SET capital=100 WHERE id=1`);
   await pool.query(`UPDATE strategy_perf SET total_pnl=0`);
   res.send("Reset complete");
@@ -130,13 +139,12 @@ app.get('/', async (req, res) => {
     if (btcChange > 1) regime = "STRONG";
     else if (btcChange < -1) regime = "WEAK";
 
-    // ===== LOAD STRATEGY PERFORMANCE =====
+    // ===== STRATEGY PERFORMANCE =====
     const perf = await pool.query(`SELECT * FROM strategy_perf`);
     const mPerf = perf.rows.find(r => r.strategy === 'momentum').total_pnl;
     const cPerf = perf.rows.find(r => r.strategy === 'crash').total_pnl;
 
     const totalPerf = Math.abs(mPerf) + Math.abs(cPerf) + 1;
-
     const momentumWeight = (mPerf + 1) / totalPerf;
     const crashWeight = (cPerf + 1) / totalPerf;
 
@@ -198,7 +206,6 @@ app.get('/', async (req, res) => {
       if (pos.pnl >= 0.03 || pos.pnl <= -0.015) {
 
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
-
         portfolio.capital += pos.value;
 
         await pool.query(
@@ -221,7 +228,7 @@ app.get('/', async (req, res) => {
       }
     }
 
-    // refresh
+    // refresh positions
     positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
 
     enriched = positions.map(p => {
@@ -280,33 +287,76 @@ app.get('/', async (req, res) => {
 
     await pool.query(`UPDATE portfolio SET capital=$1 WHERE id=1`, [portfolio.capital]);
 
+    // ===== STORE EQUITY =====
+    await pool.query(`INSERT INTO equity(value) VALUES ($1)`, [total]);
+
+    // ===== LOAD ANALYTICS =====
     const trades = await pool.query(
       `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`
     );
+
+    const equity = await pool.query(
+      `SELECT * FROM equity ORDER BY created_at ASC LIMIT 50`
+    );
+
+    const tradeStats = await pool.query(`
+      SELECT strategy,
+             COUNT(*) as count,
+             AVG(pnl) as avg_pnl
+      FROM trades
+      WHERE pnl IS NOT NULL
+      GROUP BY strategy
+    `);
 
     // ===== UI =====
     res.send(`
       <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
 
-      <h1>🧠 ML Portfolio Dashboard</h1>
+      <h1>📊 ML Trading Dashboard</h1>
 
       <div>💰 Total: €${total.toFixed(2)}</div>
       <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>
       <div>📊 BTC: ${btcChange.toFixed(2)}% (${regime})</div>
 
-      <h3>Strategy Performance</h3>
+      <h2>Strategy Performance</h2>
       <div>Momentum: ${mPerf.toFixed(4)}</div>
       <div>Crash: ${cPerf.toFixed(4)}</div>
 
-      <h3>Open Positions (${enriched.length})</h3>
+      <h2>Positions (${enriched.length})</h2>
       ${enriched.map(p =>
         `<div>${p.symbol} | ${p.strategy} | Entry: ${p.entry_price.toFixed(4)} | PnL: ${(p.pnl*100).toFixed(2)}%</div>`
       ).join('')}
 
-      <h3>Recent Trades</h3>
+      <h2>Recent Trades</h2>
       ${trades.rows.map(t =>
         `<div>${t.action} ${t.symbol} (${t.strategy || ''}) ${(t.pnl || 0).toFixed(4)}</div>`
       ).join('')}
+
+      <h2>Strategy Stats</h2>
+      ${tradeStats.rows.map(s =>
+        `<div>${s.strategy} → Trades: ${s.count} | Avg PnL: ${parseFloat(s.avg_pnl).toFixed(4)}</div>`
+      ).join('')}
+
+      <h2>Equity Curve</h2>
+      <canvas id="chart" width="300" height="150"></canvas>
+
+      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+      <script>
+      const data = {
+        labels: ${JSON.stringify(equity.rows.map((_, i) => i))},
+        datasets: [{
+          label: 'Portfolio Value',
+          data: ${JSON.stringify(equity.rows.map(e => e.value))},
+          borderColor: 'lime',
+          fill: false
+        }]
+      };
+
+      new Chart(document.getElementById('chart'), {
+        type: 'line',
+        data: data
+      });
+      </script>
 
       </body>
     `);

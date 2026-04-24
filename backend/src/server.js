@@ -50,11 +50,21 @@ async function initDB() {
 
 // ===== SCORING FUNCTION =====
 function scoreCoin(c) {
-  const momentum = Math.abs(c.change); // strength
-  const stability = (c.change > 1 && c.change < 5) ? 1 : 0; // valid zone
+  const change = c.change;
+
+  // Ignore extreme moves (likely noise or crash)
+  if (Math.abs(change) > 10) return -999;
+
+  // Only reward positive momentum
+  const momentum = change > 0 ? change : 0;
+
+  // Strong zone (early trend)
+  const stability = (change > 1 && change < 5) ? 2 : 0;
+
+  // Volume importance
   const volumeScore = Math.log10(c.volume || 1);
 
-  return momentum * 0.6 + stability * 2 + volumeScore * 0.4;
+  return momentum * 1.5 + stability * 2 + volumeScore * 0.3;
 }
 
 // ===== MAIN =====

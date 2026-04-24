@@ -57,20 +57,23 @@ async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS model_weights (
       id INT PRIMARY KEY,
-      momentum FLOAT,
+      m5 FLOAT,
+      m15 FLOAT,
+      m1h FLOAT,
+      m4h FLOAT,
+      m24h FLOAT,
       volume FLOAT,
       recovery FLOAT
     )
   `);
 
-  // Safe column add
-  await pool.query(`ALTER TABLE positions ADD COLUMN IF NOT EXISTS strategy TEXT`);
-  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy TEXT`);
-
   await pool.query(`
-    INSERT INTO model_weights VALUES (1, 1, 1, 1)
+    INSERT INTO model_weights VALUES (1,1,1,1,1,1,1,1)
     ON CONFLICT DO NOTHING
   `);
+
+  await pool.query(`ALTER TABLE positions ADD COLUMN IF NOT EXISTS strategy TEXT`);
+  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy TEXT`);
 
   const p = await pool.query(`SELECT * FROM portfolio WHERE id=1`);
   if (p.rows.length === 0) {
@@ -85,17 +88,24 @@ app.get('/reset', async (req, res) => {
   await pool.query(`DELETE FROM trades`);
   await pool.query(`DELETE FROM equity`);
   await pool.query(`UPDATE portfolio SET capital=100 WHERE id=1`);
-  await pool.query(`UPDATE model_weights SET momentum=1, volume=1, recovery=1 WHERE id=1`);
+  await pool.query(`
+    UPDATE model_weights SET m5=1,m15=1,m1h=1,m4h=1,m24h=1,volume=1,recovery=1 WHERE id=1
+  `);
   res.send("Reset complete");
 });
 
-// ===== SCORE =====
-function scoreCoin(c, Wm, Wv, Wr) {
-  const momentum = c.change;
-  const volume = Math.log10(c.volume + 1);
-  const recovery = c.change < -10 ? Math.abs(c.change) : 0;
-
-  return (Wm * momentum) + (Wv * volume) + (Wr * recovery);
+// ===== MOMENTUM =====
+async function getMomentum(symbol, interval) {
+  try {
+    const res = await axios.get(
+      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=2`
+    );
+    const prev = parseFloat(res.data[0][4]);
+    const last = parseFloat(res.data[1][4]);
+    return ((last - prev) / prev) * 100;
+  } catch {
+    return 0;
+  }
 }
 
 // ===== MAIN =====
@@ -118,15 +128,11 @@ app.get('/', async (req, res) => {
     if (btcChange > 1) regime = "STRONG";
     else if (btcChange < -1) regime = "WEAK";
 
-    // ===== LOAD WEIGHTS =====
-    const w = (await pool.query(`SELECT * FROM model_weights WHERE id=1`)).rows[0];
-    let Wm = w.momentum;
-    let Wv = w.volume;
-    let Wr = w.recovery;
+    const weights = (await pool.query(`SELECT * FROM model_weights WHERE id=1`)).rows[0];
 
-    // ===== COINS =====
-    const coins = response.data
+    let coins = response.data
       .filter(c => c.symbol.endsWith("USDT"))
+      .slice(0, 40) // limit API load
       .map(c => ({
         symbol: c.symbol,
         price: parseFloat(c.lastPrice),
@@ -134,13 +140,32 @@ app.get('/', async (req, res) => {
         volume: parseFloat(c.quoteVolume)
       }));
 
-    // ===== SCORE =====
-    const scored = coins.map(c => ({
-      ...c,
-      score: scoreCoin(c, Wm, Wv, Wr)
-    }));
+    const enrichedCoins = [];
 
-    const top5 = scored.sort((a, b) => b.score - a.score).slice(0, 5);
+    for (let c of coins) {
+
+      const m5 = await getMomentum(c.symbol, '5m');
+      const m15 = await getMomentum(c.symbol, '15m');
+      const m1h = await getMomentum(c.symbol, '1h');
+      const m4h = await getMomentum(c.symbol, '4h');
+      const m24h = c.change;
+
+      const volume = Math.log10(c.volume + 1);
+      const recovery = m24h < -10 ? Math.abs(m24h) : 0;
+
+      const score =
+        weights.m5 * m5 +
+        weights.m15 * m15 +
+        weights.m1h * m1h +
+        weights.m4h * m4h +
+        weights.m24h * m24h +
+        weights.volume * volume +
+        weights.recovery * recovery;
+
+      enrichedCoins.push({ ...c, score });
+    }
+
+    const top5 = enrichedCoins.sort((a, b) => b.score - a.score).slice(0, 5);
 
     // ===== LOAD POSITIONS =====
     let positions = (await pool.query(`
@@ -167,23 +192,32 @@ app.get('/', async (req, res) => {
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
         portfolio.capital += pos.value;
 
-        // ===== LEARNING =====
-        const lr = 0.01;
+        // LEARNING
+        const lr = 0.001;
 
-        Wm += lr * pos.pnl * (pos.price - pos.entry_price);
-        Wv += lr * pos.pnl;
-        Wr += lr * pos.pnl * (pos.pnl < 0 ? 1 : 0);
+        weights.m5  += lr * pos.pnl;
+        weights.m15 += lr * pos.pnl;
+        weights.m1h += lr * pos.pnl;
+        weights.m4h += lr * pos.pnl;
+        weights.m24h+= lr * pos.pnl;
+
+        weights.volume += lr * pos.pnl;
+        weights.recovery += lr * pos.pnl * (pos.pnl < 0 ? 1 : 0);
 
         await pool.query(`
           UPDATE model_weights
-          SET momentum=$1, volume=$2, recovery=$3
+          SET m5=$1,m15=$2,m1h=$3,m4h=$4,m24h=$5,volume=$6,recovery=$7
           WHERE id=1
-        `, [Wm, Wv, Wr]);
+        `, [
+          weights.m5, weights.m15, weights.m1h,
+          weights.m4h, weights.m24h,
+          weights.volume, weights.recovery
+        ]);
 
         await pool.query(
           `INSERT INTO trades(symbol, action, price, capital, pnl, strategy)
-           VALUES ($1,'SELL',$2,$3,$4,$5)`,
-          [pos.symbol, pos.price, pos.value, pos.pnl, pos.strategy]
+           VALUES ($1,'SELL',$2,$3,$4,'ml')`,
+          [pos.symbol, pos.price, pos.value, pos.pnl]
         );
       }
     }
@@ -196,9 +230,8 @@ app.get('/', async (req, res) => {
       FROM positions WHERE status='OPEN'
     `)).rows;
 
-    let allocation = portfolio.capital / MAX_POSITIONS;
+    const allocation = portfolio.capital / MAX_POSITIONS;
 
-    // ===== BUY =====
     for (let coin of top5) {
 
       if (positions.find(p => p.symbol === coin.symbol)) continue;
@@ -220,7 +253,7 @@ app.get('/', async (req, res) => {
       );
     }
 
-    // ===== FINAL STATE =====
+    // ===== FINAL =====
     positions = (await pool.query(`
       SELECT id, symbol, entry_price, capital, quantity,
              COALESCE(strategy,'ml') as strategy,
@@ -247,28 +280,27 @@ app.get('/', async (req, res) => {
     const trades = await pool.query(`SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`);
     const equity = await pool.query(`SELECT * FROM equity ORDER BY created_at ASC LIMIT 50`);
 
-    // ===== UI =====
     res.send(`
       <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
 
-      <h1>🧠 Learning Top-5 Engine</h1>
+      <h1>🚀 Multi-Timeframe ML Engine</h1>
 
-      <div>💰 Total: €${total.toFixed(2)}</div>
-      <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>
-      <div>📊 BTC: ${btcChange.toFixed(2)}% (${regime})</div>
+      <div>Total: €${total.toFixed(2)}</div>
+      <div>Cash: €${portfolio.capital.toFixed(2)}</div>
+      <div>BTC: ${btcChange.toFixed(2)}% (${regime})</div>
 
-      <h3>Model Weights</h3>
-      <div>Momentum: ${Wm.toFixed(3)}</div>
-      <div>Volume: ${Wv.toFixed(3)}</div>
-      <div>Recovery: ${Wr.toFixed(3)}</div>
+      <h3>Weights</h3>
+      <div>m5: ${weights.m5.toFixed(3)}</div>
+      <div>m15: ${weights.m15.toFixed(3)}</div>
+      <div>m1h: ${weights.m1h.toFixed(3)}</div>
+      <div>m4h: ${weights.m4h.toFixed(3)}</div>
+      <div>m24h: ${weights.m24h.toFixed(3)}</div>
 
-      <h3>Top 5 Coins</h3>
+      <h3>Top 5</h3>
       ${top5.map(c => `<div>${c.symbol} (${c.score.toFixed(2)})</div>`).join('')}
 
       <h3>Positions (${enriched.length})</h3>
-      ${enriched.map(p =>
-        `<div>${p.symbol} ${(p.pnl*100).toFixed(2)}%</div>`
-      ).join('')}
+      ${enriched.map(p => `<div>${p.symbol} ${(p.pnl*100).toFixed(2)}%</div>`).join('')}
 
       <h3>Recent Trades</h3>
       ${trades.rows.map(t => `<div>${t.action} ${t.symbol}</div>`).join('')}

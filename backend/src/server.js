@@ -43,7 +43,7 @@ async function initDB() {
     )
   `);
 
-  // Auto schema fix
+  // Auto-fix missing columns
   const cols = ["change FLOAT", "score FLOAT", "volume FLOAT"];
   for (let col of cols) {
     try {
@@ -109,7 +109,7 @@ app.get('/', async (req, res) => {
           !s.includes("BEAR")
         );
       })
-      .slice(0, 200) // wider scan
+      .slice(0, 200)
       .map(c => ({
         symbol: c.symbol,
         price: parseFloat(c.lastPrice),
@@ -124,37 +124,35 @@ app.get('/', async (req, res) => {
 
     const sorted = scored.sort((a, b) => b.score - a.score);
 
-    // ===== DIVERSIFIED TOP 5 =====
-    const sorted = scored.sort((a, b) => b.score - a.score);
+    // ===== DIVERSIFIED SELECTION =====
+    const candidates = sorted.slice(0, 30);
 
-// Step 1: try strict diversification
-const candidates = sorted.slice(0, 30);
+    let top5 = [];
 
-let top5 = [];
+    // Phase 1: strict diversification
+    for (let coin of candidates) {
+      if (top5.length >= 5) break;
 
-for (let coin of candidates) {
-  if (top5.length >= 5) break;
+      const similar = top5.find(c =>
+        Math.abs(c.change - coin.change) < 1.5
+      );
 
-  const similar = top5.find(c =>
-    Math.abs(c.change - coin.change) < 1.5
-  );
-
-  if (!similar && coin.change >= 1 && coin.change <= 5) {
-    top5.push(coin);
-  }
-}
-
-// Step 2: fallback (fill remaining slots)
-if (top5.length < 5) {
-  for (let coin of candidates) {
-    if (top5.length >= 5) break;
-
-    const exists = top5.find(c => c.symbol === coin.symbol);
-    if (!exists) {
-      top5.push(coin);
+      if (!similar && coin.change >= 1 && coin.change <= 5) {
+        top5.push(coin);
+      }
     }
-  }
-}
+
+    // Phase 2: fallback (ensure 5 coins)
+    if (top5.length < 5) {
+      for (let coin of candidates) {
+        if (top5.length >= 5) break;
+
+        const exists = top5.find(c => c.symbol === coin.symbol);
+        if (!exists) {
+          top5.push(coin);
+        }
+      }
+    }
 
     let positions = (await pool.query(
       `SELECT * FROM positions WHERE status='OPEN'`

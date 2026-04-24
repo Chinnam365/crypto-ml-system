@@ -68,7 +68,14 @@ app.get('/', async (req, res) => {
       }));
 
     // Pick best (by movement)
-    const best = coins.sort((a, b) => Math.abs(b.change) - Math.abs(a.change))[0];
+    const filtered = coins.filter(c =>
+  Math.abs(c.change) > 1 &&     // meaningful move
+  Math.abs(c.change) < 5        // not too extreme
+);
+
+const best = filtered.length > 0
+  ? filtered.sort((a, b) => Math.abs(b.change) - Math.abs(a.change))[0]
+  : coins[0]; // fallback
 
     let action = "HOLD";
     let tradesExecuted = [];

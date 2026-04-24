@@ -9,15 +9,25 @@ app.get('/', async (req, res) => {
       'https://api.binance.com/api/v3/ticker/24hr'
     );
 
-    const coins = response.data.slice(0, 10).map(c => ({
-      symbol: c.symbol,
-      price: c.lastPrice,
-      change: c.priceChangePercent
-    }));
+    const coins = response.data.slice(0, 10).map(c => {
+      const change = parseFloat(c.priceChangePercent);
+
+      let signal = "HOLD";
+
+      if (change > 2) signal = "BUY";
+      if (change < -2) signal = "SELL";
+
+      return {
+        symbol: c.symbol,
+        price: c.lastPrice,
+        change: change,
+        signal: signal
+      };
+    });
 
     res.json({
-      message: "Crypto ML System Running 🚀",
-      topCoins: coins
+      message: "Crypto ML Decision Engine 🚀",
+      decisions: coins
     });
 
   } catch (err) {

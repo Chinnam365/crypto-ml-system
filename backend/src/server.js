@@ -50,7 +50,7 @@ async function initDB() {
     )
   `);
 
-  // AUTO FIX
+  // AUTO FIX SCHEMA
   try { await pool.query(`ALTER TABLE positions ADD COLUMN quantity FLOAT`); } catch {}
   try { await pool.query(`ALTER TABLE trades ADD COLUMN change FLOAT`); } catch {}
   try { await pool.query(`ALTER TABLE trades ADD COLUMN score FLOAT`); } catch {}
@@ -78,7 +78,7 @@ app.get('/reset', async (req, res) => {
 
 // ===== SCORING =====
 function scoreCoin(c, w) {
-  if (c.change > 6 || c.change < -3) return -999;
+  if (c.change > 5 || c.change < -3) return -999;
   return (c.change > 0 ? c.change : 0) * w.momentum + Math.log10(c.volume || 1);
 }
 
@@ -112,19 +112,28 @@ app.get('/', async (req, res) => {
 
     const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr');
 
+    // ===== FILTERED COINS (IMPROVED) =====
     const coins = response.data
-      .filter(c =>
-        c.symbol.endsWith("USDT") &&
-        parseFloat(c.volume) > 1000000 &&
-        !c.symbol.includes("UP") &&
-        !c.symbol.includes("DOWN")
-      )
+      .filter(c => {
+        const price = parseFloat(c.lastPrice);
+        const change = parseFloat(c.priceChangePercent);
+        const volume = parseFloat(c.quoteVolume || c.volume);
+
+        return (
+          c.symbol.endsWith("USDT") &&
+          price > 0.01 &&              // remove junk coins
+          volume > 5000000 &&         // strong liquidity
+          change > -3 && change < 5 &&// stable range
+          !c.symbol.includes("UP") &&
+          !c.symbol.includes("DOWN")
+        );
+      })
       .slice(0, 200)
       .map(c => ({
         symbol: c.symbol,
         price: parseFloat(c.lastPrice),
         change: parseFloat(c.priceChangePercent),
-        volume: parseFloat(c.volume)
+        volume: parseFloat(c.quoteVolume || c.volume)
       }));
 
     const scored = coins.map(c => ({
@@ -133,8 +142,6 @@ app.get('/', async (req, res) => {
     }));
 
     const sorted = scored.sort((a, b) => b.score - a.score);
-
-    // ===== TOP 5 =====
     const top5 = sorted.slice(0, 5);
 
     // ===== LOAD POSITIONS =====
@@ -149,10 +156,10 @@ app.get('/', async (req, res) => {
       const value = p.quantity * c.price;
       const pnl = (value - p.capital) / p.capital;
 
-      return { ...p, currentPrice: c.price, value, pnl };
+      return { ...p, value, pnl, currentPrice: c.price };
     }).filter(Boolean);
 
-    // ===== EXIT =====
+    // ===== EXIT RULES =====
     for (let pos of enriched) {
       if (pos.pnl >= 0.02 || pos.pnl <= -0.01) {
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
@@ -179,20 +186,35 @@ app.get('/', async (req, res) => {
       const value = p.quantity * c.price;
       const pnl = (value - p.capital) / p.capital;
 
-      return { ...p, value, pnl };
+      return { ...p, value, pnl, currentPrice: c.price };
     }).filter(Boolean);
 
     // ===== REBALANCE =====
     for (let coin of top5) {
-      if (enriched.length >= MAX_POSITIONS) break;
-
       const exists = enriched.find(p => p.symbol === coin.symbol);
       if (exists) continue;
+
+      if (enriched.length >= MAX_POSITIONS) {
+        let worst = enriched.reduce((a, b) => a.pnl < b.pnl ? a : b);
+
+        await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [worst.id]);
+
+        portfolio.capital += worst.value;
+
+        await pool.query(
+          `INSERT INTO trades(symbol, action, price, capital, pnl)
+           VALUES ($1,'SELL (REBALANCE)',$2,$3,$4)`,
+          [worst.symbol, worst.currentPrice, worst.value, worst.pnl]
+        );
+
+        enriched = enriched.filter(p => p.id !== worst.id);
+      }
 
       const allocation = portfolio.capital / (MAX_POSITIONS - enriched.length || 1);
       if (allocation <= 0) break;
 
       const quantity = allocation / coin.price;
+
       portfolio.capital -= allocation;
 
       await pool.query(
@@ -211,13 +233,14 @@ app.get('/', async (req, res) => {
         symbol: coin.symbol,
         capital: allocation,
         quantity,
-        pnl: 0
+        pnl: 0,
+        value: allocation
       });
     }
 
-    // ===== TOTAL PORTFOLIO VALUE =====
+    // ===== TOTAL PORTFOLIO =====
     let totalValue = portfolio.capital;
-    enriched.forEach(p => totalValue += p.value || p.capital);
+    enriched.forEach(p => totalValue += p.value);
 
     await pool.query(`UPDATE portfolio SET capital=$1 WHERE id=1`, [portfolio.capital]);
 
@@ -230,7 +253,7 @@ app.get('/', async (req, res) => {
       <head><meta http-equiv="refresh" content="5"></head>
       <body style="background:#0f172a;color:white;font-family:Arial;padding:20px">
 
-      <h1>🚀 Integrated ML Portfolio Engine</h1>
+      <h1>🚀 ML Portfolio Engine (Improved)</h1>
 
       <div>💰 Total Portfolio: €${totalValue.toFixed(2)}</div>
       <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>

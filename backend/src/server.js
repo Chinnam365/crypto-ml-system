@@ -43,7 +43,7 @@ async function initDB() {
     )
   `);
 
-  // SAFE schema updates
+  // Auto schema fix
   const cols = ["change FLOAT", "score FLOAT", "volume FLOAT"];
   for (let col of cols) {
     try {
@@ -128,43 +128,48 @@ app.get('/', async (req, res) => {
       `SELECT * FROM positions WHERE status='OPEN'`
     )).rows;
 
-    const capitalPerTrade = 100 / MAX_POSITIONS;
+    // ===== ENTRY (FIXED DIVERSIFICATION) =====
+    let selectedCoins = [];
 
-    // ===== ENTRY (WITH SAFE DIVERSIFICATION) =====
     for (let coin of top5) {
-      if (positions.length >= MAX_POSITIONS) break;
+      if (positions.length + selectedCoins.length >= MAX_POSITIONS) break;
 
       const exists = positions.find(p => p.symbol === coin.symbol);
       if (exists) continue;
 
-      // Stronger diversification: avoid same price range clustering
-const similar = positions.find(p => {
-  const existing = coins.find(c => c.symbol === p.symbol);
-  if (!existing) return false;
+      // Strong diversification (momentum separation)
+      const similar = selectedCoins.find(c =>
+        Math.abs(c.change - coin.change) < 1.5
+      );
 
-  // Avoid coins with similar % change (same momentum wave)
-  return Math.abs(existing.change - coin.change) < 1.5;
-});
-
-if (similar) continue;
+      if (similar) continue;
 
       if (coin.change >= 1 && coin.change <= 5) {
-        await pool.query(
-          `INSERT INTO positions(symbol, entry_price, capital, status)
-           VALUES ($1,$2,$3,'OPEN')`,
-          [coin.symbol, coin.price, capitalPerTrade]
-        );
-
-        await pool.query(
-          `INSERT INTO trades(symbol, action, price, capital, change, score, volume)
-           VALUES ($1,'BUY',$2,$3,$4,$5,$6)`,
-          [coin.symbol, coin.price, capitalPerTrade, coin.change, coin.score, coin.volume]
-        );
-
-        // update local positions array
-        positions.push({ symbol: coin.symbol });
+        selectedCoins.push(coin);
       }
     }
+
+    // Insert AFTER selection
+    for (let coin of selectedCoins) {
+      const capitalPerTrade = 100 / MAX_POSITIONS;
+
+      await pool.query(
+        `INSERT INTO positions(symbol, entry_price, capital, status)
+         VALUES ($1,$2,$3,'OPEN')`,
+        [coin.symbol, coin.price, capitalPerTrade]
+      );
+
+      await pool.query(
+        `INSERT INTO trades(symbol, action, price, capital, change, score, volume)
+         VALUES ($1,'BUY',$2,$3,$4,$5,$6)`,
+        [coin.symbol, coin.price, capitalPerTrade, coin.change, coin.score, coin.volume]
+      );
+    }
+
+    // Refresh positions
+    positions = (await pool.query(
+      `SELECT * FROM positions WHERE status='OPEN'`
+    )).rows;
 
     // ===== EXIT =====
     let activePositions = [];

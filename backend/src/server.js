@@ -52,19 +52,20 @@ async function initDB() {
 function scoreCoin(c) {
   const change = c.change;
 
-  // Ignore extreme moves (likely noise or crash)
-  if (Math.abs(change) > 10) return -999;
+  // ❌ Ignore bad zones
+  if (change > 6 || change < -3) return -999;
 
-  // Only reward positive momentum
+  // ✅ Momentum (only positive)
   const momentum = change > 0 ? change : 0;
 
-  // Strong zone (early trend)
-  const stability = (change > 1 && change < 5) ? 2 : 0;
+  // ✅ Ideal entry zones
+  let zoneBonus = 0;
+  if (change >= 1 && change <= 3) zoneBonus = 3;
+  else if (change > 3 && change <= 5) zoneBonus = 1;
 
-  // Volume importance
   const volumeScore = Math.log10(c.volume || 1);
 
-  return momentum * 1.5 + stability * 2 + volumeScore * 0.3;
+  return momentum * 1.2 + zoneBonus + volumeScore * 0.3;
 }
 
 // ===== MAIN =====
@@ -94,21 +95,18 @@ app.get('/', async (req, res) => {
     );
 
     const coins = response.data
-  .filter(c => {
-    const symbol = c.symbol;
-
-    return (
-      symbol.endsWith("USDT") &&
-      parseFloat(c.volume) > 1000000 &&
-      parseFloat(c.lastPrice) > 0 &&
-
-      // ❌ Remove leveraged / risky tokens
-      !symbol.includes("UP") &&
-      !symbol.includes("DOWN") &&
-      !symbol.includes("BULL") &&
-      !symbol.includes("BEAR")
-    );
-  })
+      .filter(c => {
+        const symbol = c.symbol;
+        return (
+          symbol.endsWith("USDT") &&
+          parseFloat(c.volume) > 1000000 &&
+          parseFloat(c.lastPrice) > 0 &&
+          !symbol.includes("UP") &&
+          !symbol.includes("DOWN") &&
+          !symbol.includes("BULL") &&
+          !symbol.includes("BEAR")
+        );
+      })
       .slice(0, 100)
       .map(c => ({
         symbol: c.symbol,
@@ -117,13 +115,11 @@ app.get('/', async (req, res) => {
         volume: parseFloat(c.volume)
       }));
 
-    // Score all coins
     const scored = coins.map(c => ({
       ...c,
       score: scoreCoin(c)
     }));
 
-    // Top 5 coins
     const top5 = scored
       .sort((a, b) => b.score - a.score)
       .slice(0, 5);
@@ -133,9 +129,9 @@ app.get('/', async (req, res) => {
     let action = "HOLD";
     let pnl = 0;
 
-    // ENTRY
+    // ===== ENTRY =====
     if (position === "NONE") {
-      if (best.change > 1 && best.change < 5) {
+      if (best.change >= 1 && best.change <= 5) {
         position = "HOLDING";
         currentCoin = best.symbol;
         entryPrice = best.price;
@@ -143,7 +139,7 @@ app.get('/', async (req, res) => {
       }
     }
 
-    // HOLD / EXIT
+    // ===== HOLD / EXIT =====
     else if (position === "HOLDING") {
       const current = coins.find(c => c.symbol === currentCoin);
 
@@ -167,6 +163,7 @@ app.get('/', async (req, res) => {
       }
     }
 
+    // Save trade
     if (action !== "HOLD") {
       await pool.query(
         `INSERT INTO trades(symbol, action, price, capital, pnl)
@@ -175,11 +172,13 @@ app.get('/', async (req, res) => {
       );
     }
 
+    // Update state
     await pool.query(
       `UPDATE state SET capital=$1, position=$2, coin=$3, entry_price=$4 WHERE id=1`,
       [capital, position, currentCoin, entryPrice]
     );
 
+    // ===== UI =====
     res.send(`
       <html>
       <head>
@@ -190,11 +189,12 @@ app.get('/', async (req, res) => {
           .card { background:#1e293b; padding:20px; margin-bottom:15px; border-radius:10px; }
           .green { color:#22c55e; }
           .red { color:#ef4444; }
+          .yellow { color:#facc15; }
         </style>
       </head>
       <body>
 
-        <h1>🚀 Crypto ML Dashboard (Top 5 Engine)</h1>
+        <h1>🚀 Crypto ML Dashboard (Refined Engine)</h1>
 
         <div class="card">
           <h2>💰 Capital: €${capital.toFixed(2)}</h2>
@@ -218,10 +218,30 @@ app.get('/', async (req, res) => {
 
         <div class="card">
           <h3>📌 Position</h3>
-          <p>${position}</p>
-          <p>${currentCoin || "-"}</p>
-          <p>Entry: ${entryPrice || "-"}</p>
+          <p>Status: ${position}</p>
+          <p>Coin: ${currentCoin || "None"}</p>
+          <p>Entry: ${entryPrice ? entryPrice.toFixed(4) : "-"}</p>
           <p>PnL: ${(pnl * 100).toFixed(2)}%</p>
+        </div>
+
+        <div class="card">
+          <h3>⚡ Action</h3>
+          <p class="${
+            action.includes('BUY') ? 'green' :
+            action.includes('SELL') ? 'red' : 'yellow'
+          }">${action}</p>
+        </div>
+
+        <div class="card">
+          <h3>📜 Recent Trades</h3>
+          <ul>
+            ${tradesResult.rows.map(t => `
+              <li>
+                ${t.action} ${t.symbol} → €${Number(t.capital).toFixed(2)}
+                (${t.pnl ? (t.pnl * 100).toFixed(2) : 0}%)
+              </li>
+            `).join('')}
+          </ul>
         </div>
 
       </body>
@@ -233,4 +253,6 @@ app.get('/', async (req, res) => {
   }
 });
 
-app.listen(3000);
+app.listen(3000, () => {
+  console.log("Server running");
+});

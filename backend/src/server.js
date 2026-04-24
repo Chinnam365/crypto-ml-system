@@ -48,6 +48,15 @@ async function initDB() {
   }
 }
 
+// ===== SCORING FUNCTION =====
+function scoreCoin(c) {
+  const momentum = Math.abs(c.change); // strength
+  const stability = (c.change > 1 && c.change < 5) ? 1 : 0; // valid zone
+  const volumeScore = Math.log10(c.volume || 1);
+
+  return momentum * 0.6 + stability * 2 + volumeScore * 0.4;
+}
+
 // ===== MAIN =====
 app.get('/', async (req, res) => {
   try {
@@ -60,7 +69,7 @@ app.get('/', async (req, res) => {
     let currentCoin = dbState.rows[0].coin || null;
     let entryPrice = dbState.rows[0].entry_price || null;
 
-    // ✅ FIX: reset broken state
+    // Fix broken state
     if (position === "HOLDING" && !entryPrice) {
       position = "NONE";
       currentCoin = null;
@@ -80,25 +89,31 @@ app.get('/', async (req, res) => {
         parseFloat(c.volume) > 1000000 &&
         parseFloat(c.lastPrice) > 0
       )
-      .slice(0, 50)
+      .slice(0, 100)
       .map(c => ({
         symbol: c.symbol,
         price: parseFloat(c.lastPrice),
-        change: parseFloat(c.priceChangePercent)
+        change: parseFloat(c.priceChangePercent),
+        volume: parseFloat(c.volume)
       }));
 
-    const validCoins = coins.filter(c =>
-      Math.abs(c.change) > 1 && Math.abs(c.change) < 5
-    );
+    // Score all coins
+    const scored = coins.map(c => ({
+      ...c,
+      score: scoreCoin(c)
+    }));
 
-    const best = validCoins.length > 0
-      ? validCoins.sort((a, b) => Math.abs(b.change) - Math.abs(a.change))[0]
-      : coins[0];
+    // Top 5 coins
+    const top5 = scored
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+
+    const best = top5[0];
 
     let action = "HOLD";
     let pnl = 0;
 
-    // ===== ENTRY =====
+    // ENTRY
     if (position === "NONE") {
       if (best.change > 1 && best.change < 5) {
         position = "HOLDING";
@@ -108,7 +123,7 @@ app.get('/', async (req, res) => {
       }
     }
 
-    // ===== HOLD / EXIT =====
+    // HOLD / EXIT
     else if (position === "HOLDING") {
       const current = coins.find(c => c.symbol === currentCoin);
 
@@ -132,7 +147,6 @@ app.get('/', async (req, res) => {
       }
     }
 
-    // Save trade
     if (action !== "HOLD") {
       await pool.query(
         `INSERT INTO trades(symbol, action, price, capital, pnl)
@@ -141,13 +155,11 @@ app.get('/', async (req, res) => {
       );
     }
 
-    // Update state
     await pool.query(
       `UPDATE state SET capital=$1, position=$2, coin=$3, entry_price=$4 WHERE id=1`,
       [capital, position, currentCoin, entryPrice]
     );
 
-    // ===== UI =====
     res.send(`
       <html>
       <head>
@@ -158,49 +170,38 @@ app.get('/', async (req, res) => {
           .card { background:#1e293b; padding:20px; margin-bottom:15px; border-radius:10px; }
           .green { color:#22c55e; }
           .red { color:#ef4444; }
-          .yellow { color:#facc15; }
         </style>
       </head>
       <body>
 
-        <h1>🚀 Crypto ML Dashboard (Real Simulation)</h1>
+        <h1>🚀 Crypto ML Dashboard (Top 5 Engine)</h1>
 
         <div class="card">
           <h2>💰 Capital: €${capital.toFixed(2)}</h2>
         </div>
 
         <div class="card">
-          <h3>📊 Market</h3>
+          <h3>🏆 Best Coin</h3>
           <p>${best.symbol}</p>
+          <p>Score: ${best.score.toFixed(2)}</p>
           <p>Change: ${best.change.toFixed(2)}%</p>
         </div>
 
         <div class="card">
-          <h3>📌 Position</h3>
-          <p>Status: ${position}</p>
-          <p>Coin: ${currentCoin || "None"}</p>
-          <p>Entry: ${entryPrice ? entryPrice.toFixed(4) : "-"}</p>
-          <p>PnL: ${(pnl * 100).toFixed(2)}%</p>
-        </div>
-
-        <div class="card">
-          <h3>⚡ Action</h3>
-          <p class="${
-            action.includes('BUY') ? 'green' :
-            action.includes('SELL') ? 'red' : 'yellow'
-          }">${action}</p>
-        </div>
-
-        <div class="card">
-          <h3>📜 Recent Trades</h3>
+          <h3>📊 Top 5 Coins</h3>
           <ul>
-            ${tradesResult.rows.map(t => `
-              <li>
-                ${t.action} ${t.symbol} → €${Number(t.capital).toFixed(2)}
-                (${t.pnl ? (t.pnl * 100).toFixed(2) : 0}%)
-              </li>
+            ${top5.map(c => `
+              <li>${c.symbol} | Score: ${c.score.toFixed(2)} | ${c.change.toFixed(2)}%</li>
             `).join('')}
           </ul>
+        </div>
+
+        <div class="card">
+          <h3>📌 Position</h3>
+          <p>${position}</p>
+          <p>${currentCoin || "-"}</p>
+          <p>Entry: ${entryPrice || "-"}</p>
+          <p>PnL: ${(pnl * 100).toFixed(2)}%</p>
         </div>
 
       </body>
@@ -212,14 +213,4 @@ app.get('/', async (req, res) => {
   }
 });
 
-// HISTORY
-app.get('/history', async (req, res) => {
-  const result = await pool.query(
-    `SELECT * FROM trades ORDER BY created_at DESC LIMIT 20`
-  );
-  res.json(result.rows);
-});
-
-app.listen(3000, () => {
-  console.log('Server running');
-});
+app.listen(3000);

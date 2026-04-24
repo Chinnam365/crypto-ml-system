@@ -58,7 +58,11 @@ app.get('/', async (req, res) => {
     let capital = dbState.rows[0].capital;
     let position = dbState.rows[0].position || "NONE";
     let currentCoin = dbState.rows[0].coin || null;
-    let entryPrice = dbState.rows[0].entry_price || null;
+    // Fix broken state (no entry price but holding)
+if (position === "HOLDING" && !entryPrice) {
+  position = "NONE";
+  currentCoin = null;
+}
 
     const tradesResult = await pool.query(
       `SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`

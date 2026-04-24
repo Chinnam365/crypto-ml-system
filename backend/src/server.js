@@ -11,7 +11,7 @@ const pool = new Pool({
   }
 });
 
-// Initialize database
+// Initialize DB
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS state (
@@ -47,49 +47,42 @@ app.get('/', async (req, res) => {
     const dbState = await pool.query(`SELECT * FROM state WHERE id=1`);
     let capital = dbState.rows[0].capital;
 
-    // Fetch market data
+    // Fetch Binance data
     const response = await axios.get(
       'https://api.binance.com/api/v3/ticker/24hr'
     );
 
-    // Prepare coin data
+    // Filter good coins
     const coins = response.data
-  .filter(c =>
-    c.symbol.endsWith("USDT") &&              // only major pairs
-    parseFloat(c.volume) > 1000000 &&         // good liquidity
-    parseFloat(c.lastPrice) > 0               // valid price
-  )
-  .slice(0, 50)
-  .map(c => ({
-    symbol: c.symbol,
-    price: parseFloat(c.lastPrice),
-    change: parseFloat(c.priceChangePercent),
-    volume: parseFloat(c.volume)
-  }));
+      .filter(c =>
+        c.symbol.endsWith("USDT") &&
+        parseFloat(c.volume) > 1000000 &&
+        parseFloat(c.lastPrice) > 0
+      )
+      .slice(0, 50)
+      .map(c => ({
+        symbol: c.symbol,
+        price: parseFloat(c.lastPrice),
+        change: parseFloat(c.priceChangePercent),
+        volume: parseFloat(c.volume)
+      }));
 
-    // Select best opportunity (highest movement)
+    // Pick best (by movement)
     const best = coins.sort((a, b) => Math.abs(b.change) - Math.abs(a.change))[0];
 
+    let action = "HOLD";
     let tradesExecuted = [];
-    let action = "HOLD";
 
-    // Decision logic
-    let action = "HOLD";
-
-// ignore extreme spikes (already pumped)
-if (Math.abs(best.change) > 15) {
-  action = "HOLD";
-} 
-// moderate upward movement → BUY
-else if (best.change > 1 && best.change < 5) {
-  capital *= 1.01;
-  action = "BUY";
-} 
-// moderate drop → SELL
-else if (best.change < -1 && best.change > -5) {
-  capital *= 0.99;
-  action = "SELL";
-}
+    // Improved decision logic
+    if (Math.abs(best.change) > 15) {
+      action = "HOLD"; // ignore extreme spikes
+    } else if (best.change > 1 && best.change < 5) {
+      capital *= 1.01;
+      action = "BUY";
+    } else if (best.change < -1 && best.change > -5) {
+      capital *= 0.99;
+      action = "SELL";
+    }
 
     // Save trade if executed
     if (action !== "HOLD") {
@@ -108,9 +101,8 @@ else if (best.change < -1 && best.change > -5) {
       [capital]
     );
 
-    // Response
     res.json({
-      message: "Smart Trading Engine 🚀",
+      message: "Smart Trading Engine v2 🚀",
       capital: capital.toFixed(2),
       selectedCoin: best.symbol,
       change: best.change,

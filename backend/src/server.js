@@ -11,7 +11,14 @@ const pool = new Pool({
 
 const MAX_POSITIONS = 5;
 
-// ===== INIT DB (SAFE MIGRATION) =====
+// ===== SIMPLE CACHE =====
+let cache = {
+  data: {},
+  timestamp: 0
+};
+const CACHE_TTL = 60 * 1000; // 1 min
+
+// ===== INIT DB =====
 async function initDB() {
 
   await pool.query(`
@@ -61,7 +68,6 @@ async function initDB() {
     )
   `);
 
-  // ===== SAFE COLUMN ADD =====
   await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m5 FLOAT`);
   await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m15 FLOAT`);
   await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m1h FLOAT`);
@@ -70,14 +76,12 @@ async function initDB() {
   await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS volume FLOAT`);
   await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS recovery FLOAT`);
 
-  // ===== ENSURE ROW =====
   await pool.query(`
     INSERT INTO model_weights (id)
     VALUES (1)
     ON CONFLICT (id) DO NOTHING
   `);
 
-  // ===== DEFAULT VALUES =====
   await pool.query(`
     UPDATE model_weights
     SET
@@ -97,32 +101,55 @@ async function initDB() {
   }
 }
 
-// ===== MOMENTUM =====
+// ===== SAFE MOMENTUM (CACHED) =====
 async function getMomentum(symbol, interval) {
+  const key = symbol + interval;
+
+  if (cache.data[key] && Date.now() - cache.timestamp < CACHE_TTL) {
+    return cache.data[key];
+  }
+
   try {
     const res = await axios.get(
       `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=2`
     );
+
     const prev = parseFloat(res.data[0][4]);
     const last = parseFloat(res.data[1][4]);
-    return ((last - prev) / prev) * 100;
+    const val = ((last - prev) / prev) * 100;
+
+    cache.data[key] = val;
+    cache.timestamp = Date.now();
+
+    return val;
+
   } catch {
     return 0;
   }
 }
 
-// ===== CLAMP (prevents exploding ML) =====
+// ===== CLAMP =====
 function clamp(val, min = -5, max = 5) {
   return Math.max(min, Math.min(max, val));
 }
 
+// ===== FORCE RESET =====
+app.get('/force-reset', (req, res) => {
+  global.running = false;
+  res.send("Force reset done");
+});
+
 // ===== MAIN =====
 app.get('/', async (req, res) => {
 
-  if (global.running) return res.send("Processing...");
+  if (global.running) {
+    return res.send("⏳ Still processing... try again in 5s");
+  }
+
   global.running = true;
 
   try {
+
     await initDB();
 
     let portfolio = (await pool.query(`SELECT * FROM portfolio WHERE id=1`)).rows[0];
@@ -136,7 +163,7 @@ app.get('/', async (req, res) => {
 
     const coins = response.data
       .filter(c => c.symbol.endsWith("USDT"))
-      .slice(0, 40)
+      .slice(0, 10) // ✅ reduced load
       .map(c => ({
         symbol: c.symbol,
         price: parseFloat(c.lastPrice),
@@ -171,7 +198,6 @@ app.get('/', async (req, res) => {
 
     const top5 = enrichedCoins.sort((a, b) => b.score - a.score).slice(0, 5);
 
-    // ===== LOAD POSITIONS =====
     let positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
 
     let enriched = positions.map(p => {
@@ -184,14 +210,13 @@ app.get('/', async (req, res) => {
       return { ...p, value, pnl, price: coin.price };
     }).filter(Boolean);
 
-    // ===== SELL NON-TOP =====
+    // ===== SELL =====
     for (let pos of enriched) {
       if (!top5.find(c => c.symbol === pos.symbol)) {
 
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
         portfolio.capital += pos.value;
 
-        // ===== LEARNING (STABLE) =====
         const lr = 0.001;
 
         weights.m5 = clamp(weights.m5 + lr * pos.pnl);
@@ -270,18 +295,11 @@ app.get('/', async (req, res) => {
 
     res.send(`
       <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
-      <h1>🧠 Stable ML Engine</h1>
+      <h1>🚀 Stable ML Engine</h1>
 
       <div>Total: €${total.toFixed(2)}</div>
       <div>Cash: €${portfolio.capital.toFixed(2)}</div>
       <div>BTC: ${btcChange.toFixed(2)}%</div>
-
-      <h3>Weights</h3>
-      <div>m5: ${weights.m5.toFixed(2)}</div>
-      <div>m15: ${weights.m15.toFixed(2)}</div>
-      <div>m1h: ${weights.m1h.toFixed(2)}</div>
-      <div>m4h: ${weights.m4h.toFixed(2)}</div>
-      <div>m24h: ${weights.m24h.toFixed(2)}</div>
 
       <h3>Top 5</h3>
       ${top5.map(c => `<div>${c.symbol} (${c.score.toFixed(2)})</div>`).join('')}
@@ -315,9 +333,10 @@ app.get('/', async (req, res) => {
 
   } catch (err) {
     res.send("Error: " + err.message);
+  } finally {
+    global.running = false; // ✅ critical fix
   }
 
-  global.running = false;
 });
 
 app.listen(3000);

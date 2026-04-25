@@ -13,7 +13,7 @@ const MAX_POSITIONS = 5;
 const STOP_LOSS = -0.05;
 const TAKE_PROFIT = 0.05;
 
-// ===== INIT DB =====
+// ===== INIT DB (SELF-HEALING) =====
 async function initDB() {
 
   await pool.query(`
@@ -51,16 +51,26 @@ async function initDB() {
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS model_weights (
-      id INT PRIMARY KEY,
-      momentum FLOAT,
-      crash FLOAT
+      id INT PRIMARY KEY
     )
   `);
+
+  // ✅ CRITICAL FIX: Add missing columns safely
+  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS momentum FLOAT`);
+  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS crash FLOAT`);
 
   await pool.query(`
     INSERT INTO model_weights (id, momentum, crash)
     VALUES (1,1,1)
     ON CONFLICT (id) DO NOTHING
+  `);
+
+  await pool.query(`
+    UPDATE model_weights
+    SET
+      momentum = COALESCE(momentum,1),
+      crash = COALESCE(crash,1)
+    WHERE id=1
   `);
 
   const p = await pool.query(`SELECT * FROM portfolio WHERE id=1`);
@@ -83,7 +93,7 @@ async function getMomentum(symbol) {
   }
 }
 
-// ===== ROUTES =====
+// ===== RESET =====
 app.get('/force-reset', async (req, res) => {
   await pool.query(`DELETE FROM positions`);
   await pool.query(`DELETE FROM trades`);
@@ -91,6 +101,7 @@ app.get('/force-reset', async (req, res) => {
   res.send("Reset complete");
 });
 
+// ===== HISTORY =====
 app.get('/history', async (req, res) => {
   const trades = await pool.query(`SELECT * FROM trades ORDER BY created_at DESC LIMIT 50`);
 
@@ -100,9 +111,9 @@ app.get('/history', async (req, res) => {
     ${trades.rows.map(t => `
       <div>
         ${t.action} ${t.symbol} |
-        Strategy: ${t.strategy} |
+        ${t.strategy || ''} |
         €${(t.capital || 0).toFixed(2)} |
-        ${t.pnl !== null ? (t.pnl*100).toFixed(2)+'%' : ''}
+        ${t.pnl ? (t.pnl*100).toFixed(2)+'%' : ''}
       </div>
     `).join('')}
     </body>
@@ -117,7 +128,7 @@ app.get('/', async (req, res) => {
     await initDB();
 
     let portfolio = (await pool.query(`SELECT * FROM portfolio WHERE id=1`)).rows[0];
-    const weights = (await pool.query(`SELECT * FROM model_weights WHERE id=1`)).rows[0];
+    let weights = (await pool.query(`SELECT * FROM model_weights WHERE id=1`)).rows[0];
 
     const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr');
 
@@ -150,7 +161,7 @@ app.get('/', async (req, res) => {
 
     let positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
 
-    // ===== EXIT LOGIC =====
+    // ===== EXIT =====
     for (let p of positions) {
 
       const coin = coins.find(c => c.symbol === p.symbol);
@@ -165,7 +176,6 @@ app.get('/', async (req, res) => {
 
         portfolio.capital += value;
 
-        // ===== LEARNING =====
         const lr = 0.01;
 
         if (p.strategy === "momentum") {
@@ -174,11 +184,10 @@ app.get('/', async (req, res) => {
           weights.crash += lr * pnl;
         }
 
-        await pool.query(`
-          UPDATE model_weights
-          SET momentum=$1, crash=$2
-          WHERE id=1
-        `, [weights.momentum, weights.crash]);
+        await pool.query(
+          `UPDATE model_weights SET momentum=$1, crash=$2 WHERE id=1`,
+          [weights.momentum, weights.crash]
+        );
 
         await pool.query(
           `INSERT INTO trades(symbol, action, price, capital, pnl, strategy)
@@ -215,7 +224,7 @@ app.get('/', async (req, res) => {
       );
     }
 
-    // ===== FINAL VIEW =====
+    // ===== FINAL =====
     positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
 
     let total = portfolio.capital;
@@ -249,7 +258,7 @@ app.get('/', async (req, res) => {
     res.send(`
       <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
 
-      <h1>🧠 Learning ML Trader</h1>
+      <h1>🧠 ML Trader (Stable)</h1>
 
       <div>💰 Total: €${total.toFixed(2)}</div>
       <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>
@@ -258,7 +267,7 @@ app.get('/', async (req, res) => {
       <div>Trades: ${totalTrades}</div>
       <div>Win Rate: ${winRate.toFixed(2)}%</div>
 
-      <h3>⚙️ Strategy Weights</h3>
+      <h3>⚙️ Weights</h3>
       <div>Momentum: ${weights.momentum.toFixed(2)}</div>
       <div>Crash: ${weights.crash.toFixed(2)}</div>
 
@@ -267,13 +276,10 @@ app.get('/', async (req, res) => {
 
       <h3>📦 Positions</h3>
       ${enriched.map(p => `
-        <div>
-        ${p.symbol} (${p.strategy}) |
-        ${(p.pnl*100).toFixed(2)}%
-        </div>
+        <div>${p.symbol} (${p.strategy}) | ${(p.pnl*100).toFixed(2)}%</div>
       `).join('')}
 
-      <h3>📜 <a href="/history" style="color:cyan">View History</a></h3>
+      <h3><a href="/history" style="color:cyan">📜 View History</a></h3>
 
       </body>
     `);

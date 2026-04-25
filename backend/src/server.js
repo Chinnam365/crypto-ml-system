@@ -59,11 +59,6 @@ async function initDB() {
   `);
 
   await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m5 FLOAT`);
-  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m15 FLOAT`);
-  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m1h FLOAT`);
-  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m4h FLOAT`);
-  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m24h FLOAT`);
-  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS volume FLOAT`);
   await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS recovery FLOAT`);
 
   await pool.query(`
@@ -76,11 +71,6 @@ async function initDB() {
     UPDATE model_weights
     SET
       m5 = COALESCE(m5,1),
-      m15 = COALESCE(m15,1),
-      m1h = COALESCE(m1h,1),
-      m4h = COALESCE(m4h,1),
-      m24h = COALESCE(m24h,1),
-      volume = COALESCE(volume,1),
       recovery = COALESCE(recovery,1)
     WHERE id=1
   `);
@@ -124,16 +114,21 @@ function clamp(v, min = -5, max = 5) {
 }
 
 // ===== FORCE RESET =====
-app.get('/force-reset', (req, res) => {
+app.get('/force-reset', async (req, res) => {
   global.running = false;
-  res.send("Reset done");
+
+  await pool.query(`DELETE FROM positions`);
+  await pool.query(`DELETE FROM trades`);
+  await pool.query(`UPDATE portfolio SET capital=100 WHERE id=1`);
+
+  res.send("Reset complete");
 });
 
 // ===== MAIN =====
 app.get('/', async (req, res) => {
 
   if (global.running) {
-    return res.send("⏳ Processing... refresh in few seconds");
+    return res.send("⏳ Processing... try again in 5s");
   }
 
   global.running = true;
@@ -166,23 +161,12 @@ app.get('/', async (req, res) => {
     for (let c of coins) {
 
       const m5 = await getMomentum(c.symbol, '5m');
-      const m15 = await getMomentum(c.symbol, '15m');
-      const m1h = await getMomentum(c.symbol, '1h');
-      const m4h = await getMomentum(c.symbol, '4h');
       const m24h = c.change;
 
-      const volume = Math.log10(c.volume + 1);
-
-      // 🔥 CRASH BUY SIGNAL
       const recovery = (m24h < -8 && m5 > 0) ? Math.abs(m24h) : 0;
 
       const score =
         weights.m5 * m5 +
-        weights.m15 * m15 +
-        weights.m1h * m1h +
-        weights.m4h * m4h +
-        weights.m24h * m24h +
-        weights.volume * volume +
         weights.recovery * recovery;
 
       enrichedCoins.push({ ...c, score });
@@ -209,6 +193,7 @@ app.get('/', async (req, res) => {
       if (!top5.find(c => c.symbol === pos.symbol)) {
 
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
+
         portfolio.capital += pos.value;
 
         const lr = 0.001;
@@ -216,11 +201,10 @@ app.get('/', async (req, res) => {
         weights.m5 = clamp(weights.m5 + lr * pos.pnl);
         weights.recovery = clamp(weights.recovery + lr * pos.pnl);
 
-        await pool.query(`
-          UPDATE model_weights
-          SET m5=$1, recovery=$2
-          WHERE id=1
-        `, [weights.m5, weights.recovery]);
+        await pool.query(
+          `UPDATE model_weights SET m5=$1, recovery=$2 WHERE id=1`,
+          [weights.m5, weights.recovery]
+        );
 
         await pool.query(
           `INSERT INTO trades(symbol, action, price, capital, pnl, strategy)
@@ -238,9 +222,10 @@ app.get('/', async (req, res) => {
     for (let coin of top5) {
 
       if (positions.find(p => p.symbol === coin.symbol)) continue;
-      if (portfolio.capital < allocation) continue;
+      if (portfolio.capital < allocation || allocation <= 0) continue;
 
       const qty = allocation / coin.price;
+
       portfolio.capital -= allocation;
 
       await pool.query(
@@ -250,8 +235,8 @@ app.get('/', async (req, res) => {
       );
 
       await pool.query(
-        `INSERT INTO trades(symbol, action, price, capital, strategy)
-         VALUES ($1,'BUY',$2,$3,'ml')`,
+        `INSERT INTO trades(symbol, action, price, capital, pnl, strategy)
+         VALUES ($1,'BUY',$2,$3,0,'ml')`,
         [coin.symbol, coin.price, allocation]
       );
     }
@@ -276,6 +261,22 @@ app.get('/', async (req, res) => {
 
     const trades = await pool.query(`SELECT * FROM trades ORDER BY created_at DESC LIMIT 10`);
 
+    // ===== PERFORMANCE =====
+    const allTrades = await pool.query(`SELECT pnl FROM trades WHERE action='SELL'`);
+
+    let wins = 0, losses = 0, totalPnL = 0;
+
+    allTrades.rows.forEach(t => {
+      if (t.pnl > 0) wins++;
+      else if (t.pnl < 0) losses++;
+      totalPnL += t.pnl || 0;
+    });
+
+    const totalTrades = wins + losses;
+    const winRate = totalTrades ? (wins / totalTrades) * 100 : 0;
+    const lossRate = totalTrades ? (losses / totalTrades) * 100 : 0;
+    const avgPnL = totalTrades ? (totalPnL / totalTrades) * 100 : 0;
+
     res.send(`
       <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
 
@@ -285,10 +286,16 @@ app.get('/', async (req, res) => {
       <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>
       <div>📊 BTC: ${btcChange.toFixed(2)}%</div>
 
-      <h3>Top 5</h3>
+      <h3>📈 Performance</h3>
+      <div>Total Trades: ${totalTrades}</div>
+      <div>✅ Wins: ${winRate.toFixed(2)}%</div>
+      <div>❌ Losses: ${lossRate.toFixed(2)}%</div>
+      <div>📊 Avg PnL: ${avgPnL.toFixed(2)}%</div>
+
+      <h3>🏆 Top 5</h3>
       ${top5.map(c => `<div>${c.symbol} (${c.score.toFixed(2)})</div>`).join('')}
 
-      <h3>Positions (${enriched.length})</h3>
+      <h3>📦 Positions (${enriched.length})</h3>
       ${enriched.map(p => `
         <div>
         ${p.symbol} |
@@ -298,7 +305,7 @@ app.get('/', async (req, res) => {
         </div>
       `).join('')}
 
-      <h3>Trades</h3>
+      <h3>📜 Trades</h3>
       ${trades.rows.map(t => `<div>${t.action} ${t.symbol}</div>`).join('')}
 
       </body>

@@ -11,8 +11,9 @@ const pool = new Pool({
 
 const MAX_POSITIONS = 5;
 
-// ===== INIT DB =====
+// ===== INIT DB (SAFE MIGRATION) =====
 async function initDB() {
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS positions (
       id SERIAL PRIMARY KEY,
@@ -56,43 +57,45 @@ async function initDB() {
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS model_weights (
-      id INT PRIMARY KEY,
-      m5 FLOAT,
-      m15 FLOAT,
-      m1h FLOAT,
-      m4h FLOAT,
-      m24h FLOAT,
-      volume FLOAT,
-      recovery FLOAT
+      id INT PRIMARY KEY
     )
   `);
 
+  // ===== SAFE COLUMN ADD =====
+  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m5 FLOAT`);
+  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m15 FLOAT`);
+  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m1h FLOAT`);
+  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m4h FLOAT`);
+  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS m24h FLOAT`);
+  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS volume FLOAT`);
+  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS recovery FLOAT`);
+
+  // ===== ENSURE ROW =====
   await pool.query(`
-    INSERT INTO model_weights VALUES (1,1,1,1,1,1,1,1)
-    ON CONFLICT DO NOTHING
+    INSERT INTO model_weights (id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING
   `);
 
-  await pool.query(`ALTER TABLE positions ADD COLUMN IF NOT EXISTS strategy TEXT`);
-  await pool.query(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy TEXT`);
+  // ===== DEFAULT VALUES =====
+  await pool.query(`
+    UPDATE model_weights
+    SET
+      m5 = COALESCE(m5, 1),
+      m15 = COALESCE(m15, 1),
+      m1h = COALESCE(m1h, 1),
+      m4h = COALESCE(m4h, 1),
+      m24h = COALESCE(m24h, 1),
+      volume = COALESCE(volume, 1),
+      recovery = COALESCE(recovery, 1)
+    WHERE id = 1
+  `);
 
   const p = await pool.query(`SELECT * FROM portfolio WHERE id=1`);
   if (p.rows.length === 0) {
     await pool.query(`INSERT INTO portfolio VALUES (1, 100)`);
   }
 }
-
-// ===== RESET =====
-app.get('/reset', async (req, res) => {
-  await initDB();
-  await pool.query(`DELETE FROM positions`);
-  await pool.query(`DELETE FROM trades`);
-  await pool.query(`DELETE FROM equity`);
-  await pool.query(`UPDATE portfolio SET capital=100 WHERE id=1`);
-  await pool.query(`
-    UPDATE model_weights SET m5=1,m15=1,m1h=1,m4h=1,m24h=1,volume=1,recovery=1 WHERE id=1
-  `);
-  res.send("Reset complete");
-});
 
 // ===== MOMENTUM =====
 async function getMomentum(symbol, interval) {
@@ -106,6 +109,11 @@ async function getMomentum(symbol, interval) {
   } catch {
     return 0;
   }
+}
+
+// ===== CLAMP (prevents exploding ML) =====
+function clamp(val, min = -5, max = 5) {
+  return Math.max(min, Math.min(max, val));
 }
 
 // ===== MAIN =====
@@ -124,15 +132,11 @@ app.get('/', async (req, res) => {
     const btc = response.data.find(c => c.symbol === "BTCUSDT");
     const btcChange = parseFloat(btc.priceChangePercent);
 
-    let regime = "NEUTRAL";
-    if (btcChange > 1) regime = "STRONG";
-    else if (btcChange < -1) regime = "WEAK";
-
     const weights = (await pool.query(`SELECT * FROM model_weights WHERE id=1`)).rows[0];
 
-    let coins = response.data
+    const coins = response.data
       .filter(c => c.symbol.endsWith("USDT"))
-      .slice(0, 40) // limit API load
+      .slice(0, 40)
       .map(c => ({
         symbol: c.symbol,
         price: parseFloat(c.lastPrice),
@@ -168,12 +172,7 @@ app.get('/', async (req, res) => {
     const top5 = enrichedCoins.sort((a, b) => b.score - a.score).slice(0, 5);
 
     // ===== LOAD POSITIONS =====
-    let positions = (await pool.query(`
-      SELECT id, symbol, entry_price, capital, quantity,
-             COALESCE(strategy,'ml') as strategy,
-             status
-      FROM positions WHERE status='OPEN'
-    `)).rows;
+    let positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
 
     let enriched = positions.map(p => {
       const coin = coins.find(c => c.symbol === p.symbol);
@@ -192,17 +191,16 @@ app.get('/', async (req, res) => {
         await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [pos.id]);
         portfolio.capital += pos.value;
 
-        // LEARNING
+        // ===== LEARNING (STABLE) =====
         const lr = 0.001;
 
-        weights.m5  += lr * pos.pnl;
-        weights.m15 += lr * pos.pnl;
-        weights.m1h += lr * pos.pnl;
-        weights.m4h += lr * pos.pnl;
-        weights.m24h+= lr * pos.pnl;
-
-        weights.volume += lr * pos.pnl;
-        weights.recovery += lr * pos.pnl * (pos.pnl < 0 ? 1 : 0);
+        weights.m5 = clamp(weights.m5 + lr * pos.pnl);
+        weights.m15 = clamp(weights.m15 + lr * pos.pnl);
+        weights.m1h = clamp(weights.m1h + lr * pos.pnl);
+        weights.m4h = clamp(weights.m4h + lr * pos.pnl);
+        weights.m24h = clamp(weights.m24h + lr * pos.pnl);
+        weights.volume = clamp(weights.volume + lr * pos.pnl);
+        weights.recovery = clamp(weights.recovery + lr * pos.pnl);
 
         await pool.query(`
           UPDATE model_weights
@@ -222,13 +220,8 @@ app.get('/', async (req, res) => {
       }
     }
 
-    // ===== RELOAD =====
-    positions = (await pool.query(`
-      SELECT id, symbol, entry_price, capital, quantity,
-             COALESCE(strategy,'ml') as strategy,
-             status
-      FROM positions WHERE status='OPEN'
-    `)).rows;
+    // ===== BUY =====
+    positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
 
     const allocation = portfolio.capital / MAX_POSITIONS;
 
@@ -254,12 +247,7 @@ app.get('/', async (req, res) => {
     }
 
     // ===== FINAL =====
-    positions = (await pool.query(`
-      SELECT id, symbol, entry_price, capital, quantity,
-             COALESCE(strategy,'ml') as strategy,
-             status
-      FROM positions WHERE status='OPEN'
-    `)).rows;
+    positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
 
     enriched = positions.map(p => {
       const coin = coins.find(c => c.symbol === p.symbol);
@@ -282,19 +270,18 @@ app.get('/', async (req, res) => {
 
     res.send(`
       <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
-
-      <h1>🚀 Multi-Timeframe ML Engine</h1>
+      <h1>🧠 Stable ML Engine</h1>
 
       <div>Total: €${total.toFixed(2)}</div>
       <div>Cash: €${portfolio.capital.toFixed(2)}</div>
-      <div>BTC: ${btcChange.toFixed(2)}% (${regime})</div>
+      <div>BTC: ${btcChange.toFixed(2)}%</div>
 
       <h3>Weights</h3>
-      <div>m5: ${weights.m5.toFixed(3)}</div>
-      <div>m15: ${weights.m15.toFixed(3)}</div>
-      <div>m1h: ${weights.m1h.toFixed(3)}</div>
-      <div>m4h: ${weights.m4h.toFixed(3)}</div>
-      <div>m24h: ${weights.m24h.toFixed(3)}</div>
+      <div>m5: ${weights.m5.toFixed(2)}</div>
+      <div>m15: ${weights.m15.toFixed(2)}</div>
+      <div>m1h: ${weights.m1h.toFixed(2)}</div>
+      <div>m4h: ${weights.m4h.toFixed(2)}</div>
+      <div>m24h: ${weights.m24h.toFixed(2)}</div>
 
       <h3>Top 5</h3>
       ${top5.map(c => `<div>${c.symbol} (${c.score.toFixed(2)})</div>`).join('')}

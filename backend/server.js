@@ -17,7 +17,6 @@ const STOP_LOSS = -0.025;
 const MIN_PROB = 0.52;
 const LR = 0.08;
 
-// ================= SYMBOLS =================
 const SYMBOLS = [
   "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
   "ADAUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","MATICUSDT"
@@ -192,7 +191,6 @@ async function runEngine() {
 
   // ===== POSITION SIZING =====
   if (cash > 1 && top.length > 0) {
-
     const weightsAlloc = top.map(c => Math.max(0, c.prob - MIN_PROB));
     const sum = weightsAlloc.reduce((a, b) => a + b, 0);
 
@@ -223,7 +221,7 @@ async function runEngine() {
   await pool.query(`UPDATE portfolio SET cash=$1,total=$2`, [cash, totalValue]);
   await pool.query(`UPDATE model SET weights=$1`, [JSON.stringify(weights)]);
 
-  return { top, weights };
+  console.log("Engine tick complete");
 }
 
 // ================= PERFORMANCE =================
@@ -240,13 +238,12 @@ async function getPerformance() {
 
 // ================= ROUTES =================
 app.get("/", async (req, res) => {
-  await initDB();
-
-  const { top, weights } = await runEngine();
   const perf = await getPerformance();
+  const modelRes = await pool.query(`SELECT * FROM model LIMIT 1`);
+  const weights = modelRes.rows[0].weights;
 
   res.send(`
-    <h1>🧠 ML Engine v11.5 (Position Sizing)</h1>
+    <h1>🧠 ML Engine v11.6 (Auto Trading)</h1>
 
     <h3>Performance</h3>
     Trades: ${perf.trades}<br/>
@@ -258,15 +255,11 @@ app.get("/", async (req, res) => {
     w3: ${weights.w3.toFixed(2)}<br/>
     w4: ${weights.w4.toFixed(2)}
 
-    <h3>Top Picks</h3>
-    ${top.map(c => `<div>${c.symbol} (${(c.prob*100).toFixed(1)}%)</div>`).join("")}
-
     <br/><a href="/history">History</a>
     <br/><a href="/reset">Reset</a>
   `);
 });
 
-// HISTORY
 app.get("/history", async (req, res) => {
   const result = await pool.query(`
     SELECT symbol, type, pnl, created_at 
@@ -282,12 +275,24 @@ app.get("/history", async (req, res) => {
   `);
 });
 
-// RESET
 app.get("/reset", async (req, res) => {
   await pool.query(`TRUNCATE positions, trades, model, portfolio RESTART IDENTITY`);
   res.send("Reset complete. <a href='/'>Restart</a>");
 });
 
-// START
+// ================= START =================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Running on", PORT));
+
+app.listen(PORT, async () => {
+  console.log("Server running on", PORT);
+  await initDB();
+
+  // 🔁 BACKGROUND LOOP
+  setInterval(async () => {
+    try {
+      await runEngine();
+    } catch (e) {
+      console.error("Engine error:", e.message);
+    }
+  }, 60 * 1000); // every 1 min
+});

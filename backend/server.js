@@ -125,7 +125,7 @@ function pickTop(coins) {
 ========================= */
 
 function trade(topCoins) {
-  if (positions.length > 0) return;
+  if (positions.length >= 5) return;
 
   const allocation = portfolio.cash / 5;
 
@@ -165,7 +165,7 @@ function updatePositions(coins) {
     if (!isFinite(pnl)) return;
 
     // SELL conditions
-    if (pnl > 0.02 || pnl < -0.02 || age > 60) {
+    if (pnl > 0.01 || pnl < -0.01 || age > 10) {
       portfolio.cash += value;
 
       trades.push(`SELL ${p.symbol} (${(pnl * 100).toFixed(2)}%)`);

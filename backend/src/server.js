@@ -1,287 +1,235 @@
-const express = require('express');
-const axios = require('axios');
-const { Pool } = require('pg');
+const express = require("express");
+const axios = require("axios");
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+/* =========================
+   IN-MEMORY STATE (Render-safe)
+========================= */
 
-const MAX_POSITIONS = 5;
-const STOP_LOSS = -0.05;
-const TAKE_PROFIT = 0.05;
+let portfolio = {
+  capital: 100,
+  cash: 100
+};
 
-// ===== INIT DB (SELF-HEALING) =====
-async function initDB() {
+let positions = [];
+let trades = [];
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS positions (
-      id SERIAL PRIMARY KEY,
-      symbol TEXT,
-      entry_price FLOAT,
-      capital FLOAT,
-      quantity FLOAT,
-      strategy TEXT,
-      status TEXT,
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
+let weights = {
+  momentum: 1,
+  crash: 1
+};
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS trades (
-      id SERIAL PRIMARY KEY,
-      symbol TEXT,
-      action TEXT,
-      price FLOAT,
-      capital FLOAT,
-      pnl FLOAT,
-      strategy TEXT,
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
+let stats = {
+  wins: 0,
+  losses: 0,
+  total: 0
+};
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS portfolio (
-      id INT PRIMARY KEY,
-      capital FLOAT
-    )
-  `);
+/* =========================
+   SAFE HELPERS
+========================= */
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS model_weights (
-      id INT PRIMARY KEY
-    )
-  `);
-
-  // ✅ CRITICAL FIX: Add missing columns safely
-  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS momentum FLOAT`);
-  await pool.query(`ALTER TABLE model_weights ADD COLUMN IF NOT EXISTS crash FLOAT`);
-
-  await pool.query(`
-    INSERT INTO model_weights (id, momentum, crash)
-    VALUES (1,1,1)
-    ON CONFLICT (id) DO NOTHING
-  `);
-
-  await pool.query(`
-    UPDATE model_weights
-    SET
-      momentum = COALESCE(momentum,1),
-      crash = COALESCE(crash,1)
-    WHERE id=1
-  `);
-
-  const p = await pool.query(`SELECT * FROM portfolio WHERE id=1`);
-  if (p.rows.length === 0) {
-    await pool.query(`INSERT INTO portfolio VALUES (1,100)`);
-  }
+function safe(n, def = 0) {
+  return isFinite(n) ? n : def;
 }
 
-// ===== MOMENTUM =====
-async function getMomentum(symbol) {
-  try {
-    const res = await axios.get(
-      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=5m&limit=2`
-    );
-    const prev = parseFloat(res.data[0][4]);
-    const last = parseFloat(res.data[1][4]);
-    return ((last - prev) / prev) * 100;
-  } catch {
-    return 0;
-  }
+/* =========================
+   MARKET DATA
+========================= */
+
+async function getMarket() {
+  const res = await axios.get(
+    "https://api.binance.com/api/v3/ticker/24hr"
+  );
+
+  return res.data
+    .filter(c => c.symbol.endsWith("USDT"))
+    .map(c => ({
+      symbol: c.symbol,
+      change: parseFloat(c.priceChangePercent),
+      volume: parseFloat(c.quoteVolume),
+      price: parseFloat(c.lastPrice)
+    }));
 }
 
-// ===== RESET =====
-app.get('/force-reset', async (req, res) => {
-  await pool.query(`DELETE FROM positions`);
-  await pool.query(`DELETE FROM trades`);
-  await pool.query(`UPDATE portfolio SET capital=100 WHERE id=1`);
-  res.send("Reset complete");
-});
+/* =========================
+   STRATEGY (Momentum + Crash)
+========================= */
 
-// ===== HISTORY =====
-app.get('/history', async (req, res) => {
-  const trades = await pool.query(`SELECT * FROM trades ORDER BY created_at DESC LIMIT 50`);
+function scoreCoins(coins) {
+  return coins.map(c => {
+    let score = 0;
+    let strategy = "momentum";
 
-  res.send(`
-    <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
-    <h2>📜 Trade History</h2>
-    ${trades.rows.map(t => `
-      <div>
-        ${t.action} ${t.symbol} |
-        ${t.strategy || ''} |
-        €${(t.capital || 0).toFixed(2)} |
-        ${t.pnl ? (t.pnl*100).toFixed(2)+'%' : ''}
-      </div>
-    `).join('')}
-    </body>
-  `);
-});
+    // momentum
+    score += weights.momentum * safe(c.change);
 
-// ===== MAIN =====
-app.get('/', async (req, res) => {
-
-  try {
-
-    await initDB();
-
-    let portfolio = (await pool.query(`SELECT * FROM portfolio WHERE id=1`)).rows[0];
-    let weights = (await pool.query(`SELECT * FROM model_weights WHERE id=1`)).rows[0];
-
-    const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr');
-
-    const coins = response.data
-      .filter(c => c.symbol.endsWith("USDT"))
-      .slice(0, 10)
-      .map(c => ({
-        symbol: c.symbol,
-        price: parseFloat(c.lastPrice),
-        change: parseFloat(c.priceChangePercent)
-      }));
-
-    const enrichedCoins = [];
-
-    for (let c of coins) {
-
-      const momentum = await getMomentum(c.symbol);
-      const crash = (c.change < -8 && momentum > 0) ? Math.abs(c.change) : 0;
-
-      const score =
-        weights.momentum * momentum +
-        weights.crash * crash;
-
-      const strategy = crash > 0 ? "crash" : "momentum";
-
-      enrichedCoins.push({ ...c, score, strategy });
+    // crash buy (oversold bounce)
+    if (c.change < -5) {
+      score += weights.crash * Math.abs(c.change);
+      strategy = "crash";
     }
 
-    const top5 = enrichedCoins.sort((a, b) => b.score - a.score).slice(0, 5);
+    return { ...c, score, strategy };
+  });
+}
 
-    let positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
+/* =========================
+   SELECT TOP 5
+========================= */
 
-    // ===== EXIT =====
-    for (let p of positions) {
+function pickTop(coins) {
+  return coins
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+}
 
-      const coin = coins.find(c => c.symbol === p.symbol);
-      if (!coin) continue;
+/* =========================
+   TRADING ENGINE
+========================= */
 
-      const value = p.quantity * coin.price;
-      const pnl = (value - p.capital) / p.capital;
+function trade(topCoins) {
+  const allocation = portfolio.cash / 5;
 
-      if (pnl <= STOP_LOSS || pnl >= TAKE_PROFIT || !top5.find(c => c.symbol === p.symbol)) {
+  topCoins.forEach(coin => {
+    if (portfolio.cash <= 0) return;
 
-        await pool.query(`UPDATE positions SET status='CLOSED' WHERE id=$1`, [p.id]);
+    const qty = allocation / coin.price;
+    if (!isFinite(qty) || qty <= 0) return;
 
-        portfolio.capital += value;
-
-        const lr = 0.01;
-
-        if (p.strategy === "momentum") {
-          weights.momentum += lr * pnl;
-        } else {
-          weights.crash += lr * pnl;
-        }
-
-        await pool.query(
-          `UPDATE model_weights SET momentum=$1, crash=$2 WHERE id=1`,
-          [weights.momentum, weights.crash]
-        );
-
-        await pool.query(
-          `INSERT INTO trades(symbol, action, price, capital, pnl, strategy)
-           VALUES ($1,'SELL',$2,$3,$4,$5)`,
-          [p.symbol, coin.price, value, pnl, p.strategy]
-        );
-      }
-    }
-
-    // ===== BUY =====
-    positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
-
-    const allocation = portfolio.capital / MAX_POSITIONS;
-
-    for (let coin of top5) {
-
-      if (positions.find(p => p.symbol === coin.symbol)) continue;
-      if (portfolio.capital < allocation || allocation <= 0) continue;
-
-      const qty = allocation / coin.price;
-
-      portfolio.capital -= allocation;
-
-      await pool.query(
-        `INSERT INTO positions(symbol, entry_price, capital, quantity, strategy, status)
-         VALUES ($1,$2,$3,$4,$5,'OPEN')`,
-        [coin.symbol, coin.price, allocation, qty, coin.strategy]
-      );
-
-      await pool.query(
-        `INSERT INTO trades(symbol, action, price, capital, strategy)
-         VALUES ($1,'BUY',$2,$3,$4)`,
-        [coin.symbol, coin.price, allocation, coin.strategy]
-      );
-    }
-
-    // ===== FINAL =====
-    positions = (await pool.query(`SELECT * FROM positions WHERE status='OPEN'`)).rows;
-
-    let total = portfolio.capital;
-
-    const enriched = positions.map(p => {
-      const coin = coins.find(c => c.symbol === p.symbol);
-      if (!coin) return null;
-
-      const value = p.quantity * coin.price;
-      total += value;
-
-      const pnl = (value - p.capital) / p.capital;
-
-      return { ...p, value, pnl };
-    }).filter(Boolean);
-
-    await pool.query(`UPDATE portfolio SET capital=$1 WHERE id=1`, [portfolio.capital]);
-
-    const trades = await pool.query(`SELECT * FROM trades WHERE action='SELL'`);
-
-    let wins = 0, losses = 0;
-
-    trades.rows.forEach(t => {
-      if (t.pnl > 0) wins++;
-      else if (t.pnl < 0) losses++;
+    positions.push({
+      symbol: coin.symbol,
+      entry: coin.price,
+      quantity: qty,
+      capital: allocation,
+      strategy: coin.strategy
     });
 
-    const totalTrades = wins + losses;
-    const winRate = totalTrades ? (wins / totalTrades) * 100 : 0;
+    portfolio.cash -= allocation;
+
+    trades.push(`BUY ${coin.symbol}`);
+  });
+}
+
+/* =========================
+   POSITION UPDATE
+========================= */
+
+function updatePositions(coins) {
+  const updated = [];
+
+  positions.forEach(p => {
+    const coin = coins.find(c => c.symbol === p.symbol);
+    if (!coin) return;
+
+    const value = safe(p.quantity) * safe(coin.price);
+    const pnl = safe((value - p.capital) / p.capital);
+
+    if (!isFinite(pnl)) return;
+
+    // SELL RULES
+    if (pnl > 0.05 || pnl < -0.03) {
+      portfolio.cash += value;
+
+      trades.push(`SELL ${p.symbol} (${(pnl * 100).toFixed(2)}%)`);
+
+      stats.total++;
+      if (pnl > 0) stats.wins++;
+      else stats.losses++;
+
+      // LEARNING
+      if (p.strategy === "momentum") {
+        weights.momentum += pnl > 0 ? 0.05 : -0.05;
+      } else {
+        weights.crash += pnl > 0 ? 0.05 : -0.05;
+      }
+
+    } else {
+      updated.push({
+        ...p,
+        pnl
+      });
+    }
+  });
+
+  positions = updated;
+}
+
+/* =========================
+   TOTAL VALUE
+========================= */
+
+function getTotal(coins) {
+  let total = safe(portfolio.cash);
+
+  positions.forEach(p => {
+    const coin = coins.find(c => c.symbol === p.symbol);
+    if (!coin) return;
+
+    const value = safe(p.quantity) * safe(coin.price);
+    if (isFinite(value)) total += value;
+  });
+
+  return total;
+}
+
+/* =========================
+   DASHBOARD
+========================= */
+
+app.get("/", async (req, res) => {
+  try {
+    const coins = await getMarket();
+
+    const scored = scoreCoins(coins);
+    const top = pickTop(scored);
+
+    // trade only if no positions
+    if (positions.length === 0) {
+      trade(top);
+    }
+
+    updatePositions(coins);
+
+    const total = getTotal(coins);
 
     res.send(`
-      <body style="background:#0f172a;color:white;padding:20px;font-family:Arial">
+    <html>
+    <body style="background:#0b1220;color:white;font-family:sans-serif;padding:20px">
 
-      <h1>🧠 ML Trader (Stable)</h1>
+    <h1>🧠 ML Engine (Stable)</h1>
 
-      <div>💰 Total: €${total.toFixed(2)}</div>
-      <div>💵 Cash: €${portfolio.capital.toFixed(2)}</div>
+    <p>💰 Total: €${safe(total).toFixed(2)}</p>
+    <p>💵 Cash: €${safe(portfolio.cash).toFixed(2)}</p>
 
-      <h3>📈 Performance</h3>
-      <div>Trades: ${totalTrades}</div>
-      <div>Win Rate: ${winRate.toFixed(2)}%</div>
+    <h3>📊 Performance</h3>
+    <p>Trades: ${stats.total}</p>
+    <p>Win Rate: ${
+      stats.total ? ((stats.wins / stats.total) * 100).toFixed(2) : 0
+    }%</p>
 
-      <h3>⚙️ Weights</h3>
-      <div>Momentum: ${weights.momentum.toFixed(2)}</div>
-      <div>Crash: ${weights.crash.toFixed(2)}</div>
+    <h3>⚙️ Weights</h3>
+    <p>Momentum: ${safe(weights.momentum).toFixed(2)}</p>
+    <p>Crash: ${safe(weights.crash).toFixed(2)}</p>
 
-      <h3>🏆 Top 5</h3>
-      ${top5.map(c => `<div>${c.symbol} (${c.strategy})</div>`).join('')}
+    <h3>🏆 Top 5</h3>
+    ${top.map(c => `<p>${c.symbol} (${c.strategy})</p>`).join("")}
 
-      <h3>📦 Positions</h3>
-      ${enriched.map(p => `
-        <div>${p.symbol} (${p.strategy}) | ${(p.pnl*100).toFixed(2)}%</div>
-      `).join('')}
+    <h3>📦 Positions (${positions.length})</h3>
+    ${positions.map(p =>
+      `<p>${p.symbol} (${p.strategy}) | ${(safe(p.pnl) * 100).toFixed(2)}%</p>`
+    ).join("")}
 
-      <h3><a href="/history" style="color:cyan">📜 View History</a></h3>
+    <h3>📜 Trades</h3>
+    ${trades.slice(-10).map(t => `<p>${t}</p>`).join("")}
 
-      </body>
+    <br/>
+    <a href="/reset" style="color:cyan">Reset</a>
+
+    </body>
+    </html>
     `);
 
   } catch (err) {
@@ -289,4 +237,24 @@ app.get('/', async (req, res) => {
   }
 });
 
-app.listen(3000);
+/* =========================
+   RESET
+========================= */
+
+app.get("/reset", (req, res) => {
+  portfolio = { capital: 100, cash: 100 };
+  positions = [];
+  trades = [];
+  weights = { momentum: 1, crash: 1 };
+  stats = { wins: 0, losses: 0, total: 0 };
+
+  res.send("Reset done");
+});
+
+/* =========================
+   START
+========================= */
+
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});

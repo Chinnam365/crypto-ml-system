@@ -11,13 +11,13 @@ const pool = new Pool({
 });
 
 // ================= CONFIG =================
-const HOLD_TIME = 10;
-const TAKE_PROFIT = 0.025;
-const STOP_LOSS = -0.02;
-const MIN_PROB = 0.55;
+const HOLD_TIME = 20;
+const TAKE_PROFIT = 0.04;
+const STOP_LOSS = -0.025;
+const MIN_PROB = 0.52;
 const LR = 0.08;
 
-// Only strong coins (avoid junk)
+// ================= SYMBOLS =================
 const SYMBOLS = [
   "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
   "ADAUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","MATICUSDT"
@@ -90,20 +90,19 @@ async function getKlines(symbol) {
 // ================= FEATURES =================
 function extractFeatures(klines) {
   const closes = klines.map(k => parseFloat(k[4]));
-
   const last = closes[closes.length - 1];
   const prev = closes[closes.length - 2];
 
-  const f1 = (last - prev) / prev; // short momentum
-  const f2 = (last - closes[0]) / closes[0]; // trend
+  const f1 = (last - prev) / prev;
+  const f2 = (last - closes[0]) / closes[0];
 
   const max = Math.max(...closes);
   const min = Math.min(...closes);
-  const f3 = (max - min) / min; // volatility
+  const f3 = (max - min) / min;
 
-  const f4 = (last - max) / max; // pullback
+  const f4 = (last - max) / max;
 
-  return { f1, f2, f3, f4 };
+  return { f1, f2, f3, f4, price: last };
 }
 
 // ================= MODEL =================
@@ -118,7 +117,6 @@ function predict(f, w) {
     f.f3 * w.w3 +
     f.f4 * w.w4;
 
-  // clamp probability
   return Math.min(0.75, Math.max(0.25, sigmoid(raw)));
 }
 
@@ -133,10 +131,10 @@ async function runEngine() {
   const positionsRes = await pool.query(`SELECT * FROM positions`);
   let totalValue = cash;
 
-  // ===== SELL / HOLD =====
+  // ===== SELL =====
   for (let pos of positionsRes.rows) {
     const klines = await getKlines(pos.symbol);
-    const price = parseFloat(klines[klines.length - 1][4]);
+    const price = parseFloat(klines[19][4]);
 
     const pnl = (price - pos.entry) / pos.entry;
     totalValue += pos.amount * price;
@@ -154,7 +152,7 @@ async function runEngine() {
 
       cash += pos.amount * price;
 
-      // ===== LEARNING =====
+      // learning
       const predicted = predict(pos, weights);
       const actual = pnl > 0 ? 1 : 0;
       const error = actual - predicted;
@@ -173,29 +171,38 @@ async function runEngine() {
   }
 
   // ===== BUY =====
-  const existingSymbols = positionsRes.rows.map(p => p.symbol);
-  const scored = [];
+  const existing = positionsRes.rows.map(p => p.symbol);
+  const candidates = [];
 
   for (let symbol of SYMBOLS) {
     const klines = await getKlines(symbol);
     const f = extractFeatures(klines);
     const prob = predict(f, weights);
 
-    if (!existingSymbols.includes(symbol)) {
-      scored.push({ symbol, prob, ...f, price: parseFloat(klines[19][4]) });
+    if (!existing.includes(symbol)) {
+      if (prob > MIN_PROB || Math.random() < 0.2) {
+        candidates.push({ symbol, prob, ...f });
+      }
     }
   }
 
-  const top = scored
-    .filter(c => c.prob > MIN_PROB)
+  const top = candidates
     .sort((a, b) => b.prob - a.prob)
     .slice(0, 5);
 
+  // ===== POSITION SIZING =====
   if (cash > 1 && top.length > 0) {
-    const invest = cash / top.length;
 
-    for (let coin of top) {
-      const amount = invest / coin.price;
+    const weightsAlloc = top.map(c => Math.max(0, c.prob - MIN_PROB));
+    const sum = weightsAlloc.reduce((a, b) => a + b, 0);
+
+    for (let i = 0; i < top.length; i++) {
+      const coin = top[i];
+
+      const allocation =
+        sum > 0 ? (weightsAlloc[i] / sum) * cash : cash / top.length;
+
+      const amount = allocation / coin.price;
 
       await pool.query(
         `INSERT INTO positions (symbol,entry,amount,cycles,f1,f2,f3,f4)
@@ -213,15 +220,8 @@ async function runEngine() {
     cash = 0;
   }
 
-  await pool.query(
-    `UPDATE portfolio SET cash=$1,total=$2`,
-    [cash, totalValue]
-  );
-
-  await pool.query(
-    `UPDATE model SET weights=$1`,
-    [JSON.stringify(weights)]
-  );
+  await pool.query(`UPDATE portfolio SET cash=$1,total=$2`, [cash, totalValue]);
+  await pool.query(`UPDATE model SET weights=$1`, [JSON.stringify(weights)]);
 
   return { top, weights };
 }
@@ -229,7 +229,6 @@ async function runEngine() {
 // ================= PERFORMANCE =================
 async function getPerformance() {
   const t = await pool.query(`SELECT * FROM trades WHERE type='SELL'`);
-
   const wins = t.rows.filter(r => r.pnl > 0).length;
   const total = t.rows.length;
 
@@ -241,50 +240,43 @@ async function getPerformance() {
 
 // ================= ROUTES =================
 app.get("/", async (req, res) => {
-  try {
-    await initDB();
+  await initDB();
 
-    const { top, weights } = await runEngine();
-    const perf = await getPerformance();
+  const { top, weights } = await runEngine();
+  const perf = await getPerformance();
 
-    res.send(`
-      <h1>🧠 ML Engine v11 (Live Signals)</h1>
+  res.send(`
+    <h1>🧠 ML Engine v11.5 (Position Sizing)</h1>
 
-      <h3>📊 Performance</h3>
-      Trades: ${perf.trades}<br/>
-      Win Rate: ${perf.winRate}%
+    <h3>Performance</h3>
+    Trades: ${perf.trades}<br/>
+    Win Rate: ${perf.winRate}%
 
-      <h3>🧠 Model</h3>
-      w1: ${weights.w1.toFixed(2)}<br/>
-      w2: ${weights.w2.toFixed(2)}<br/>
-      w3: ${weights.w3.toFixed(2)}<br/>
-      w4: ${weights.w4.toFixed(2)}
+    <h3>Model</h3>
+    w1: ${weights.w1.toFixed(2)}<br/>
+    w2: ${weights.w2.toFixed(2)}<br/>
+    w3: ${weights.w3.toFixed(2)}<br/>
+    w4: ${weights.w4.toFixed(2)}
 
-      <h3>🏆 Top Picks</h3>
-      ${top.map(c => `<div>${c.symbol} (${(c.prob*100).toFixed(1)}%)</div>`).join("")}
+    <h3>Top Picks</h3>
+    ${top.map(c => `<div>${c.symbol} (${(c.prob*100).toFixed(1)}%)</div>`).join("")}
 
-      <br/><a href="/history">History</a>
-      <br/><a href="/reset">Reset</a>
-    `);
-  } catch (e) {
-    console.error(e);
-    res.send("ERROR: " + e.message);
-  }
+    <br/><a href="/history">History</a>
+    <br/><a href="/reset">Reset</a>
+  `);
 });
 
 // HISTORY
 app.get("/history", async (req, res) => {
   const result = await pool.query(`
     SELECT symbol, type, pnl, created_at 
-    FROM trades 
-    ORDER BY created_at DESC 
-    LIMIT 50
+    FROM trades ORDER BY created_at DESC LIMIT 50
   `);
 
   res.send(`
-    <h1>📜 Trade History</h1>
+    <h1>Trade History</h1>
     ${result.rows.map(r => `
-      <div>${r.type} ${r.symbol} | ${(r.pnl * 100).toFixed(2)}%</div>
+      <div>${r.type} ${r.symbol} | ${(r.pnl*100).toFixed(2)}%</div>
     `).join("")}
     <br/><a href="/">Back</a>
   `);
@@ -296,6 +288,6 @@ app.get("/reset", async (req, res) => {
   res.send("Reset complete. <a href='/'>Restart</a>");
 });
 
-// ================= START =================
+// START
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Running on", PORT));

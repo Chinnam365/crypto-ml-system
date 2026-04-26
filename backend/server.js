@@ -4,15 +4,17 @@ const { Pool } = require("pg");
 
 const app = express();
 
+// ================= DB =================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
+// ================= CONFIG =================
 const HOLD_TIME = 3;
 const TAKE_PROFIT = 0.02;
 const STOP_LOSS = -0.03;
-const LR = 0.1; // learning rate
+const LR = 0.1;
 
 // ================= INIT =================
 async function initDB() {
@@ -32,7 +34,9 @@ async function initDB() {
       amount FLOAT,
       cycles INT DEFAULT 0,
       f1 FLOAT,
-      f2 FLOAT
+      f2 FLOAT,
+      f3 FLOAT,
+      f4 FLOAT
     );
   `);
 
@@ -54,16 +58,18 @@ async function initDB() {
     );
   `);
 
+  // Init portfolio
   const p = await pool.query(`SELECT * FROM portfolio`);
   if (p.rows.length === 0) {
     await pool.query(`INSERT INTO portfolio (cash,total) VALUES (100,100)`);
   }
 
+  // Init model
   const m = await pool.query(`SELECT * FROM model`);
   if (m.rows.length === 0) {
     await pool.query(
       `INSERT INTO model (weights) VALUES ($1)`,
-      [JSON.stringify({ w1: 0.5, w2: 0.5 })]
+      [JSON.stringify({ w1: 0.5, w2: 0.5, w3: 0.5, w4: 0.5 })]
     );
   }
 }
@@ -76,10 +82,17 @@ async function getPrices() {
 
 // ================= FEATURES =================
 function extractFeatures(c) {
-  const momentum = parseFloat(c.priceChangePercent) / 100;
-  const crash = momentum < -0.05 ? Math.abs(momentum) : 0;
+  const change = parseFloat(c.priceChangePercent) / 100;
+  const high = parseFloat(c.highPrice);
+  const low = parseFloat(c.lowPrice);
+  const last = parseFloat(c.lastPrice);
 
-  return { f1: momentum, f2: crash };
+  const f1 = change; // momentum
+  const f2 = change < -0.05 ? Math.abs(change) : 0; // crash
+  const f3 = (last - low) / (high - low + 1e-6); // range position
+  const f4 = (high - low) / low; // volatility
+
+  return { f1, f2, f3, f4 };
 }
 
 // ================= MODEL =================
@@ -88,7 +101,12 @@ function sigmoid(x) {
 }
 
 function predict(f, w) {
-  return sigmoid(f.f1 * w.w1 + f.f2 * w.w2);
+  return sigmoid(
+    f.f1 * w.w1 +
+    f.f2 * w.w2 +
+    f.f3 * w.w3 +
+    f.f4 * w.w4
+  );
 }
 
 // ================= ENGINE =================
@@ -128,13 +146,15 @@ async function runEngine() {
 
       cash += pos.amount * price;
 
-      // ===== REAL LEARNING =====
-      const predicted = predict({ f1: pos.f1, f2: pos.f2 }, weights);
+      // ===== LEARNING =====
+      const predicted = predict(pos, weights);
       const actual = pnl > 0 ? 1 : 0;
       const error = actual - predicted;
 
       weights.w1 += LR * error * pos.f1;
       weights.w2 += LR * error * pos.f2;
+      weights.w3 += LR * error * pos.f3;
+      weights.w4 += LR * error * pos.f4;
 
     } else {
       await pool.query(
@@ -165,9 +185,9 @@ async function runEngine() {
       const amount = invest / price;
 
       await pool.query(
-        `INSERT INTO positions (symbol,entry,amount,cycles,f1,f2)
-         VALUES ($1,$2,$3,0,$4,$5)`,
-        [coin.symbol, price, amount, coin.f1, coin.f2]
+        `INSERT INTO positions (symbol,entry,amount,cycles,f1,f2,f3,f4)
+         VALUES ($1,$2,$3,0,$4,$5,$6,$7)`,
+        [coin.symbol, price, amount, coin.f1, coin.f2, coin.f3, coin.f4]
       );
 
       await pool.query(
@@ -208,7 +228,9 @@ async function getPerformance() {
   };
 }
 
-// ================= ROUTE =================
+// ================= ROUTES =================
+
+// MAIN
 app.get("/", async (req, res) => {
   try {
     await initDB();
@@ -217,7 +239,7 @@ app.get("/", async (req, res) => {
     const perf = await getPerformance();
 
     res.send(`
-      <h1>🧠 ML Engine v8 (Real Learning)</h1>
+      <h1>🧠 ML Engine v9</h1>
 
       <h3>📊 Performance</h3>
       Trades: ${perf.trades}<br/>
@@ -225,7 +247,9 @@ app.get("/", async (req, res) => {
 
       <h3>🧠 Model</h3>
       w1: ${weights.w1.toFixed(2)}<br/>
-      w2: ${weights.w2.toFixed(2)}
+      w2: ${weights.w2.toFixed(2)}<br/>
+      w3: ${weights.w3.toFixed(2)}<br/>
+      w4: ${weights.w4.toFixed(2)}
 
       <h3>🏆 Top 5</h3>
       ${top5.map(c => `<div>${c.symbol} (${(c.prob*100).toFixed(1)}%)</div>`).join("")}
@@ -237,6 +261,38 @@ app.get("/", async (req, res) => {
     console.error(e);
     res.send("ERROR: " + e.message);
   }
+});
+
+// HISTORY
+app.get("/history", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT symbol, type, pnl, created_at 
+      FROM trades 
+      ORDER BY created_at DESC 
+      LIMIT 50
+    `);
+
+    res.send(`
+      <h1>📜 Trade History</h1>
+      ${result.rows.map(r => `
+        <div>${r.type} ${r.symbol} | ${(r.pnl * 100).toFixed(2)}%</div>
+      `).join("")}
+      <br/><a href="/">Back</a>
+    `);
+  } catch (e) {
+    res.send("ERROR: " + e.message);
+  }
+});
+
+// RESET
+app.get("/reset", async (req, res) => {
+  await pool.query(`DELETE FROM positions`);
+  await pool.query(`DELETE FROM trades`);
+  await pool.query(`DELETE FROM model`);
+  await pool.query(`DELETE FROM portfolio`);
+
+  res.send("Reset done. <a href='/'>Restart</a>");
 });
 
 // ================= START =================

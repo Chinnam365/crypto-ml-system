@@ -283,16 +283,22 @@ app.get("/reset", async (req, res) => {
 // ================= START =================
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, async () => {
-  console.log("Server running on", PORT);
+async function startApp() {
   await initDB();
 
-  // 🔁 BACKGROUND LOOP
+  app.listen(PORT, () => {
+    console.log("Server running on", PORT);
+  });
+
+  // 🔁 BACKGROUND LOOP (reliable)
   setInterval(async () => {
     try {
       await runEngine();
+      console.log("Engine tick...");
     } catch (e) {
       console.error("Engine error:", e.message);
     }
-  }, 60 * 1000); // every 1 min
-});
+  }, 60 * 1000);
+}
+
+startApp();

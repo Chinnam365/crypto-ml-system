@@ -130,7 +130,7 @@ function updatePositions(coins) {
     if (!isFinite(pnl)) return;
 
     // SELL RULES
-    if (pnl > 0.05 || pnl < -0.03) {
+    if (pnl > 0.02 || pnl < -0.02) {
       portfolio.cash += value;
 
       trades.push(`SELL ${p.symbol} (${(pnl * 100).toFixed(2)}%)`);

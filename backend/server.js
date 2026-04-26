@@ -4,32 +4,40 @@ const axios = require("axios");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* STATE */
+/* =========================
+   STATE
+========================= */
 
 let portfolio = { capital: 100, cash: 100 };
 let positions = [];
 let trades = [];
 
-let weights = {
-  short: 1,
-  mid: 1,
-  long: 1,
-  crash: 1
-};
-
 let stats = { wins: 0, losses: 0, total: 0 };
 
-/* HELPERS */
+// ML weights (learned)
+let model = {
+  w: [0, 0, 0, 0, 0], // features
+  bias: 0
+};
+
+// training data (in-memory)
+let dataset = [];
+
+/* =========================
+   HELPERS
+========================= */
 
 function safe(n, def = 0) {
   return isFinite(n) ? n : def;
 }
 
 function sigmoid(x) {
-  return 1 / (1 + Math.exp(-x / 10));
+  return 1 / (1 + Math.exp(-x));
 }
 
-/* MARKET */
+/* =========================
+   FETCH DATA
+========================= */
 
 async function getKlines(symbol, interval) {
   const res = await axios.get(
@@ -50,7 +58,7 @@ async function getMarket() {
   const base = res.data
     .filter(c => c.symbol.endsWith("USDT"))
     .filter(c => parseFloat(c.quoteVolume) > 5000000)
-    .slice(0, 30);
+    .slice(0, 25);
 
   const enriched = [];
 
@@ -63,27 +71,25 @@ async function getMarket() {
         getKlines(c.symbol, "4h")
       ]);
 
-      const rawScore =
-        weights.short * (m5 + m15) +
-        weights.mid * h1 +
-        weights.long * (h4 + parseFloat(c.priceChangePercent));
+      const features = [
+        safe(m5),
+        safe(m15),
+        safe(h1),
+        safe(h4),
+        safe(parseFloat(c.priceChangePercent))
+      ];
 
-      let strategy = "momentum";
+      const z =
+        features.reduce((sum, f, i) => sum + f * model.w[i], 0) +
+        model.bias;
 
-      let crashBonus = 0;
-      if (parseFloat(c.priceChangePercent) < -3) {
-        crashBonus = weights.crash * Math.abs(parseFloat(c.priceChangePercent));
-        strategy = "crash";
-      }
-
-      const finalScore = rawScore + crashBonus;
-      const probability = sigmoid(finalScore);
+      const prob = sigmoid(z);
 
       enriched.push({
         symbol: c.symbol,
         price: parseFloat(c.lastPrice),
-        probability,
-        strategy
+        features,
+        probability: prob
       });
 
     } catch {
@@ -94,14 +100,15 @@ async function getMarket() {
   return enriched.sort((a, b) => b.probability - a.probability);
 }
 
-/* TRADING */
+/* =========================
+   TRADE
+========================= */
 
 function trade(coins) {
   if (positions.length >= 5) return;
 
   const top = coins.slice(0, 5);
-
-  const totalProb = top.reduce((sum, c) => sum + c.probability, 0);
+  const totalProb = top.reduce((s, c) => s + c.probability, 0);
 
   top.forEach(c => {
     const weight = c.probability / totalProb;
@@ -115,7 +122,7 @@ function trade(coins) {
       entry: c.price,
       quantity: qty,
       capital: allocation,
-      strategy: c.strategy,
+      features: c.features,
       time: Date.now()
     });
 
@@ -125,7 +132,28 @@ function trade(coins) {
   });
 }
 
-/* UPDATE + LEARNING */
+/* =========================
+   LEARNING (CORE ML)
+========================= */
+
+function train(features, label) {
+  const lr = 0.01;
+
+  const z =
+    features.reduce((sum, f, i) => sum + f * model.w[i], 0) +
+    model.bias;
+
+  const pred = sigmoid(z);
+  const error = label - pred;
+
+  // update weights
+  model.w = model.w.map((w, i) => w + lr * error * features[i]);
+  model.bias += lr * error;
+}
+
+/* =========================
+   UPDATE POSITIONS
+========================= */
 
 function updatePositions(coins) {
   const updated = [];
@@ -145,19 +173,17 @@ function updatePositions(coins) {
 
       trades.push(`SELL ${p.symbol} (${(pnl * 100).toFixed(2)}%)`);
 
+      const label = pnl > 0 ? 1 : 0;
+
+      // store dataset
+      dataset.push({ features: p.features, label });
+
+      // train model
+      train(p.features, label);
+
       stats.total++;
-      if (pnl > 0) stats.wins++;
+      if (label === 1) stats.wins++;
       else stats.losses++;
-
-      const delta = pnl > 0 ? 0.05 : -0.05;
-
-      if (p.strategy === "momentum") {
-        weights.short += delta;
-        weights.mid += delta;
-        weights.long += delta;
-      } else {
-        weights.crash += delta;
-      }
 
     } else {
       updated.push({ ...p, pnl });
@@ -167,7 +193,9 @@ function updatePositions(coins) {
   positions = updated;
 }
 
-/* TOTAL */
+/* =========================
+   TOTAL
+========================= */
 
 function getTotal(coins) {
   let total = portfolio.cash;
@@ -182,7 +210,9 @@ function getTotal(coins) {
   return total;
 }
 
-/* DASHBOARD */
+/* =========================
+   DASHBOARD
+========================= */
 
 app.get("/", async (req, res) => {
   try {
@@ -196,7 +226,7 @@ app.get("/", async (req, res) => {
     res.send(`
     <body style="background:#0b1220;color:white;font-family:sans-serif;padding:20px">
 
-    <h1>🧠 ML Engine v4</h1>
+    <h1>🧠 ML Engine v5 (Learning)</h1>
 
     <p>💰 Total: €${safe(total).toFixed(2)}</p>
     <p>💵 Cash: €${safe(portfolio.cash).toFixed(2)}</p>
@@ -205,13 +235,10 @@ app.get("/", async (req, res) => {
     <p>Trades: ${stats.total}</p>
     <p>Win Rate: ${stats.total ? ((stats.wins / stats.total) * 100).toFixed(2) : 0}%</p>
 
-    <h3>⚙️ Weights</h3>
-    <p>Short: ${weights.short.toFixed(2)}</p>
-    <p>Mid: ${weights.mid.toFixed(2)}</p>
-    <p>Long: ${weights.long.toFixed(2)}</p>
-    <p>Crash: ${weights.crash.toFixed(2)}</p>
+    <h3>🧠 Model</h3>
+    <p>Weights: ${model.w.map(w => w.toFixed(2)).join(", ")}</p>
 
-    <h3>🏆 Top (by probability)</h3>
+    <h3>🏆 Top (learned probability)</h3>
     ${coins.slice(0,5).map(c =>
       `<p>${c.symbol} (${(c.probability*100).toFixed(1)}%)</p>`
     ).join("")}
@@ -224,12 +251,13 @@ app.get("/", async (req, res) => {
     <h3>📜 Trades</h3>
     ${trades.slice(-10).map(t => `<p>${t}</p>`).join("")}
 
+    <p>📚 Dataset size: ${dataset.length}</p>
+
     <br/>
     <a href="/reset" style="color:cyan">Reset</a>
 
     </body>
-    `
-    );
+    `);
 
   } catch (e) {
     res.send("Error: " + e.message);
@@ -242,8 +270,9 @@ app.get("/reset", (req, res) => {
   portfolio = { capital: 100, cash: 100 };
   positions = [];
   trades = [];
-  weights = { short: 1, mid: 1, long: 1, crash: 1 };
   stats = { wins: 0, losses: 0, total: 0 };
+  dataset = [];
+  model = { w: [0, 0, 0, 0, 0], bias: 0 };
 
   res.send("Reset done");
 });

@@ -17,10 +17,10 @@ const STOP_LOSS = -0.025;
 const MIN_PROB = 0.52;
 const LR = 0.08;
 
-// ===== RISK ENGINE =====
-const MAX_RISK_PER_TRADE = 0.25;   // max 25% capital per trade
-const MAX_TOTAL_EXPOSURE = 0.9;    // max 90% invested
-const MAX_DRAWDOWN = 0.2;          // stop trading if -20%
+// ===== RISK =====
+const MAX_RISK_PER_TRADE = 0.25;
+const MAX_TOTAL_EXPOSURE = 0.9;
+const MAX_DRAWDOWN = 0.2;
 
 const SYMBOLS = [
   "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
@@ -86,12 +86,17 @@ async function initDB() {
   }
 }
 
-// ================= MARKET =================
+// ================= SAFE API =================
 async function getKlines(symbol) {
-  const res = await axios.get(
-    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=5m&limit=20`
-  );
-  return res.data;
+  try {
+    const res = await axios.get(
+      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=5m&limit=20`
+    );
+    return res.data;
+  } catch (err) {
+    console.error("API error:", symbol);
+    return null;
+  }
 }
 
 // ================= FEATURES =================
@@ -129,206 +134,199 @@ function predict(f, w) {
 
 // ================= ENGINE =================
 async function runEngine() {
-  const modelRes = await pool.query(`SELECT * FROM model LIMIT 1`);
-  let weights = modelRes.rows[0].weights;
+  try {
+    const modelRes = await pool.query(`SELECT * FROM model LIMIT 1`);
+    let weights = modelRes.rows[0].weights;
 
-  const pRes = await pool.query(`SELECT * FROM portfolio LIMIT 1`);
-  let { cash, total, peak } = pRes.rows[0];
+    const pRes = await pool.query(`SELECT * FROM portfolio LIMIT 1`);
+    let { cash, total, peak } = pRes.rows[0];
 
-  const posRes = await pool.query(`SELECT * FROM positions`);
-  let totalValue = cash;
+    const posRes = await pool.query(`SELECT * FROM positions`);
+    let totalValue = cash;
 
-  // ===== UPDATE TOTAL =====
-  for (let pos of posRes.rows) {
-    const klines = await getKlines(pos.symbol);
-    const price = parseFloat(klines[19][4]);
-    totalValue += pos.amount * price;
-  }
+    // ===== VALUE =====
+    for (let pos of posRes.rows) {
+      const klines = await getKlines(pos.symbol);
+      if (!klines) continue;
 
-  // ===== DRAW DOWN CONTROL =====
-  peak = Math.max(peak, totalValue);
-  const drawdown = (peak - totalValue) / peak;
+      const price = parseFloat(klines[19][4]);
+      if (!price || isNaN(price)) continue;
 
-  if (drawdown > MAX_DRAWDOWN) {
-    console.log("⚠️ Max drawdown hit. Stopping trading.");
-    await pool.query(
-      `UPDATE portfolio SET total=$1, peak=$2`,
-      [totalValue, peak]
-    );
-    return;
-  }
-
-  // ===== SELL =====
-  for (let pos of posRes.rows) {
-    const klines = await getKlines(pos.symbol);
-    const price = parseFloat(klines[19][4]);
-
-    const pnl = (price - pos.entry) / pos.entry;
-    let cycles = pos.cycles + 1;
-
-    if (
-      pnl >= TAKE_PROFIT ||
-      pnl <= STOP_LOSS ||
-      cycles >= HOLD_TIME ||
-      (cycles > 5 && pnl > 0)
-    ) {
-      await pool.query(`DELETE FROM positions WHERE id=$1`, [pos.id]);
-
-      await pool.query(
-        `INSERT INTO trades (symbol,type,price,pnl)
-         VALUES ($1,$2,$3,$4)`,
-        [pos.symbol, "SELL", price, pnl]
-      );
-
-      cash += pos.amount * price;
-
-      // learning
-      const predicted = predict(pos, weights);
-      const actual = pnl > 0 ? 1 : 0;
-      const error = actual - predicted;
-
-      weights.w1 += LR * error * pos.f1;
-      weights.w2 += LR * error * pos.f2;
-      weights.w3 += LR * error * pos.f3;
-      weights.w4 += LR * error * pos.f4;
-
-    } else {
-      await pool.query(
-        `UPDATE positions SET cycles=$1 WHERE id=$2`,
-        [cycles, pos.id]
-      );
+      totalValue += pos.amount * price;
     }
-  }
 
-  // ===== BUY =====
-  const existing = posRes.rows.map(p => p.symbol);
-  const candidates = [];
+    // ===== DRAWDOWN =====
+    peak = Math.max(peak, totalValue);
+    const drawdown = (peak - totalValue) / peak;
 
-  for (let symbol of SYMBOLS) {
-    const klines = await getKlines(symbol);
-    const f = extractFeatures(klines);
-    const prob = predict(f, weights);
+    if (drawdown > MAX_DRAWDOWN) {
+      console.log("⚠️ Drawdown stop triggered");
+      await pool.query(
+        `UPDATE portfolio SET total=$1, peak=$2`,
+        [totalValue, peak]
+      );
+      return;
+    }
 
-    if (!existing.includes(symbol)) {
-      if (prob > MIN_PROB || Math.random() < 0.2) {
-        candidates.push({ symbol, prob, ...f });
+    // ===== SELL =====
+    for (let pos of posRes.rows) {
+      const klines = await getKlines(pos.symbol);
+      if (!klines) continue;
+
+      const price = parseFloat(klines[19][4]);
+      if (!price || isNaN(price)) continue;
+
+      const pnl = (price - pos.entry) / pos.entry;
+      let cycles = pos.cycles + 1;
+
+      if (
+        pnl >= TAKE_PROFIT ||
+        pnl <= STOP_LOSS ||
+        cycles >= HOLD_TIME ||
+        (cycles > 5 && pnl > 0)
+      ) {
+        await pool.query(`DELETE FROM positions WHERE id=$1`, [pos.id]);
+
+        await pool.query(
+          `INSERT INTO trades (symbol,type,price,pnl)
+           VALUES ($1,$2,$3,$4)`,
+          [pos.symbol, "SELL", price, pnl]
+        );
+
+        cash += pos.amount * price;
+
+        const predicted = predict(pos, weights);
+        const actual = pnl > 0 ? 1 : 0;
+        const error = actual - predicted;
+
+        weights.w1 += LR * error * pos.f1;
+        weights.w2 += LR * error * pos.f2;
+        weights.w3 += LR * error * pos.f3;
+        weights.w4 += LR * error * pos.f4;
+
+      } else {
+        await pool.query(
+          `UPDATE positions SET cycles=$1 WHERE id=$2`,
+          [cycles, pos.id]
+        );
       }
     }
-  }
 
-  const top = candidates.sort((a, b) => b.prob - a.prob).slice(0, 5);
+    // ===== BUY =====
+    const existing = posRes.rows.map(p => p.symbol);
+    const candidates = [];
 
-  // ===== POSITION SIZING + RISK =====
-  let invested = totalValue - cash;
-  let exposure = invested / totalValue;
+    for (let symbol of SYMBOLS) {
+      const klines = await getKlines(symbol);
+      if (!klines) continue;
 
-  if (cash > 1 && exposure < MAX_TOTAL_EXPOSURE && top.length > 0) {
-    const weightsAlloc = top.map(c => Math.max(0, c.prob - MIN_PROB));
-    const sum = weightsAlloc.reduce((a, b) => a + b, 0);
+      const f = extractFeatures(klines);
+      if (!f.price || isNaN(f.price)) continue;
 
-    for (let i = 0; i < top.length; i++) {
-      const coin = top[i];
+      const prob = predict(f, weights);
 
-      let allocation =
-        sum > 0 ? (weightsAlloc[i] / sum) * cash : cash / top.length;
-
-      // risk cap per trade
-      allocation = Math.min(allocation, totalValue * MAX_RISK_PER_TRADE);
-
-      if (allocation < 1) continue;
-
-      const amount = allocation / coin.price;
-
-      await pool.query(
-        `INSERT INTO positions (symbol,entry,amount,cycles,f1,f2,f3,f4)
-         VALUES ($1,$2,$3,0,$4,$5,$6,$7)`,
-        [coin.symbol, coin.price, amount, coin.f1, coin.f2, coin.f3, coin.f4]
-      );
-
-      await pool.query(
-        `INSERT INTO trades (symbol,type,price,pnl)
-         VALUES ($1,$2,$3,$4)`,
-        [coin.symbol, "BUY", coin.price, 0]
-      );
-
-      cash -= allocation;
+      if (!existing.includes(symbol)) {
+        if (prob > MIN_PROB || Math.random() < 0.2) {
+          candidates.push({ symbol, prob, ...f });
+        }
+      }
     }
-  }
 
-  // ===== ANTI-STALL =====
-  const remaining = await pool.query(`SELECT * FROM positions`);
-  if (remaining.rows.length === 0 && cash > 1) {
-    const symbol = SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
-    const klines = await getKlines(symbol);
-    const f = extractFeatures(klines);
+    const top = candidates.sort((a, b) => b.prob - a.prob).slice(0, 5);
 
-    const amount = cash / f.price;
+    let invested = totalValue - cash;
+    let exposure = invested / totalValue;
+
+    if (cash > 1 && exposure < MAX_TOTAL_EXPOSURE && top.length > 0) {
+      const weightsAlloc = top.map(c => Math.max(0, c.prob - MIN_PROB));
+      const sum = weightsAlloc.reduce((a, b) => a + b, 0);
+
+      for (let i = 0; i < top.length; i++) {
+        const coin = top[i];
+
+        let allocation =
+          sum > 0 ? (weightsAlloc[i] / sum) * cash : cash / top.length;
+
+        allocation = Math.min(allocation, totalValue * MAX_RISK_PER_TRADE);
+        if (allocation < 1) continue;
+
+        const amount = allocation / coin.price;
+
+        await pool.query(
+          `INSERT INTO positions (symbol,entry,amount,cycles,f1,f2,f3,f4)
+           VALUES ($1,$2,$3,0,$4,$5,$6,$7)`,
+          [coin.symbol, coin.price, amount, coin.f1, coin.f2, coin.f3, coin.f4]
+        );
+
+        await pool.query(
+          `INSERT INTO trades (symbol,type,price,pnl)
+           VALUES ($1,$2,$3,$4)`,
+          [coin.symbol, "BUY", coin.price, 0]
+        );
+
+        cash -= allocation;
+      }
+    }
+
+    // ===== ANTI-STUCK =====
+    const remaining = await pool.query(`SELECT * FROM positions`);
+    if (remaining.rows.length === 0 && cash > 1) {
+      const symbol = SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
+      const klines = await getKlines(symbol);
+      if (klines) {
+        const f = extractFeatures(klines);
+        const amount = cash / f.price;
+
+        await pool.query(
+          `INSERT INTO positions (symbol,entry,amount,cycles,f1,f2,f3,f4)
+           VALUES ($1,$2,$3,0,$4,$5,$6,$7)`,
+          [symbol, f.price, amount, f.f1, f.f2, f.f3, f.f4]
+        );
+
+        cash = 0;
+      }
+    }
 
     await pool.query(
-      `INSERT INTO positions (symbol,entry,amount,cycles,f1,f2,f3,f4)
-       VALUES ($1,$2,$3,0,$4,$5,$6,$7)`,
-      [symbol, f.price, amount, f.f1, f.f2, f.f3, f.f4]
+      `UPDATE portfolio SET cash=$1,total=$2,peak=$3`,
+      [cash, totalValue, peak]
     );
 
-    cash = 0;
+    await pool.query(
+      `UPDATE model SET weights=$1`,
+      [JSON.stringify(weights)]
+    );
+
+    console.log("✅ Engine tick success");
+
+  } catch (err) {
+    console.error("❌ Engine internal error:", err.message);
   }
-
-  await pool.query(
-    `UPDATE portfolio SET cash=$1,total=$2,peak=$3`,
-    [cash, totalValue, peak]
-  );
-
-  await pool.query(
-    `UPDATE model SET weights=$1`,
-    [JSON.stringify(weights)]
-  );
-
-  console.log("Engine tick complete");
-}
-
-// ================= PERFORMANCE =================
-async function getPerformance() {
-  const t = await pool.query(`SELECT * FROM trades WHERE type='SELL'`);
-  const wins = t.rows.filter(r => r.pnl > 0).length;
-  const total = t.rows.length;
-
-  return {
-    trades: total,
-    winRate: total === 0 ? 0 : ((wins / total) * 100).toFixed(2)
-  };
 }
 
 // ================= ROUTES =================
 app.get("/", async (req, res) => {
-  const perf = await getPerformance();
-  const m = await pool.query(`SELECT * FROM model LIMIT 1`);
-  const weights = m.rows[0].weights;
+  const t = await pool.query(`SELECT * FROM trades WHERE type='SELL'`);
+  const wins = t.rows.filter(r => r.pnl > 0).length;
 
   res.send(`
-    <h1>🧠 ML Engine v12 (Risk Managed)</h1>
-
-    Trades: ${perf.trades}<br/>
-    Win Rate: ${perf.winRate}%<br/><br/>
-
-    w1: ${weights.w1.toFixed(2)}<br/>
-    w2: ${weights.w2.toFixed(2)}<br/>
-    w3: ${weights.w3.toFixed(2)}<br/>
-    w4: ${weights.w4.toFixed(2)}<br/><br/>
-
-    <a href="/history">History</a><br/>
-    <a href="/reset">Reset</a>
+    <h1>🧠 ML Engine v12.1 (Stable)</h1>
+    Trades: ${t.rows.length}<br/>
+    Win Rate: ${t.rows.length ? ((wins/t.rows.length)*100).toFixed(2) : 0}%
+    <br/><br/>
+    <a href="/history">History</a>
+    <br/><a href="/reset">Reset</a>
   `);
 });
 
 app.get("/history", async (req, res) => {
-  const result = await pool.query(`
-    SELECT symbol, type, pnl FROM trades
-    ORDER BY created_at DESC LIMIT 50
-  `);
+  const r = await pool.query(`SELECT * FROM trades ORDER BY created_at DESC LIMIT 50`);
+  res.send(r.rows.map(x => `<div>${x.type} ${x.symbol} ${(x.pnl*100).toFixed(2)}%</div>`).join(""));
+});
 
-  res.send(result.rows.map(r =>
-    `<div>${r.type} ${r.symbol} | ${(r.pnl*100).toFixed(2)}%</div>`
-  ).join(""));
+app.get("/reset", async (req, res) => {
+  await pool.query(`TRUNCATE positions, trades, model, portfolio RESTART IDENTITY`);
+  res.send("Reset done");
 });
 
 // ================= START =================
@@ -341,7 +339,9 @@ async function start() {
     console.log("Running on", PORT);
   });
 
-  setInterval(runEngine, 60 * 1000);
+  setInterval(async () => {
+    await runEngine();
+  }, 60 * 1000);
 }
 
 start();

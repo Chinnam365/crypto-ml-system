@@ -11,11 +11,17 @@ const pool = new Pool({
 });
 
 // ================= CONFIG =================
-const HOLD_TIME = 8;
-const TAKE_PROFIT = 0.03;
+const HOLD_TIME = 10;
+const TAKE_PROFIT = 0.025;
 const STOP_LOSS = -0.02;
 const MIN_PROB = 0.55;
-const LR = 0.1;
+const LR = 0.08;
+
+// Only strong coins (avoid junk)
+const SYMBOLS = [
+  "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+  "ADAUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","MATICUSDT"
+];
 
 // ================= INIT =================
 async function initDB() {
@@ -74,24 +80,30 @@ async function initDB() {
 }
 
 // ================= MARKET =================
-async function getPrices() {
-  const res = await axios.get("https://api.binance.com/api/v3/ticker/24hr");
+async function getKlines(symbol) {
+  const res = await axios.get(
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=5m&limit=20`
+  );
   return res.data;
 }
 
 // ================= FEATURES =================
-function extractFeatures(c) {
-  const change = parseFloat(c.priceChangePercent) / 100;
-  const high = parseFloat(c.highPrice);
-  const low = parseFloat(c.lowPrice);
-  const last = parseFloat(c.lastPrice);
+function extractFeatures(klines) {
+  const closes = klines.map(k => parseFloat(k[4]));
 
-  return {
-    f1: change,
-    f2: change < -0.05 ? Math.abs(change) : 0,
-    f3: (last - low) / (high - low + 1e-6),
-    f4: (high - low) / low
-  };
+  const last = closes[closes.length - 1];
+  const prev = closes[closes.length - 2];
+
+  const f1 = (last - prev) / prev; // short momentum
+  const f2 = (last - closes[0]) / closes[0]; // trend
+
+  const max = Math.max(...closes);
+  const min = Math.min(...closes);
+  const f3 = (max - min) / min; // volatility
+
+  const f4 = (last - max) / max; // pullback
+
+  return { f1, f2, f3, f4 };
 }
 
 // ================= MODEL =================
@@ -100,18 +112,18 @@ function sigmoid(x) {
 }
 
 function predict(f, w) {
-  return sigmoid(
+  const raw =
     f.f1 * w.w1 +
     f.f2 * w.w2 +
     f.f3 * w.w3 +
-    f.f4 * w.w4
-  );
+    f.f4 * w.w4;
+
+  // clamp probability
+  return Math.min(0.75, Math.max(0.25, sigmoid(raw)));
 }
 
 // ================= ENGINE =================
 async function runEngine() {
-  const prices = await getPrices();
-
   const modelRes = await pool.query(`SELECT * FROM model LIMIT 1`);
   let weights = modelRes.rows[0].weights;
 
@@ -119,18 +131,16 @@ async function runEngine() {
   let cash = portfolioRes.rows[0].cash;
 
   const positionsRes = await pool.query(`SELECT * FROM positions`);
-
   let totalValue = cash;
 
   // ===== SELL / HOLD =====
   for (let pos of positionsRes.rows) {
-    const market = prices.find(p => p.symbol === pos.symbol);
-    if (!market) continue;
+    const klines = await getKlines(pos.symbol);
+    const price = parseFloat(klines[klines.length - 1][4]);
 
-    const price = parseFloat(market.lastPrice);
     const pnl = (price - pos.entry) / pos.entry;
-
     totalValue += pos.amount * price;
+
     let cycles = pos.cycles + 1;
 
     if (pnl >= TAKE_PROFIT || pnl <= STOP_LOSS || cycles >= HOLD_TIME) {
@@ -163,39 +173,40 @@ async function runEngine() {
   }
 
   // ===== BUY =====
-  const usdt = prices.filter(p => p.symbol.endsWith("USDT"));
-
-  const scored = usdt.map(c => {
-    const f = extractFeatures(c);
-    const prob = predict(f, weights);
-    return { symbol: c.symbol, prob, ...f };
-  });
-
   const existingSymbols = positionsRes.rows.map(p => p.symbol);
+  const scored = [];
 
-  const topCandidates = scored
-    .filter(c => c.prob > MIN_PROB && !existingSymbols.includes(c.symbol))
+  for (let symbol of SYMBOLS) {
+    const klines = await getKlines(symbol);
+    const f = extractFeatures(klines);
+    const prob = predict(f, weights);
+
+    if (!existingSymbols.includes(symbol)) {
+      scored.push({ symbol, prob, ...f, price: parseFloat(klines[19][4]) });
+    }
+  }
+
+  const top = scored
+    .filter(c => c.prob > MIN_PROB)
     .sort((a, b) => b.prob - a.prob)
     .slice(0, 5);
 
-  if (cash > 1 && topCandidates.length > 0) {
-    const invest = cash / topCandidates.length;
+  if (cash > 1 && top.length > 0) {
+    const invest = cash / top.length;
 
-    for (let coin of topCandidates) {
-      const market = prices.find(p => p.symbol === coin.symbol);
-      const price = parseFloat(market.lastPrice);
-      const amount = invest / price;
+    for (let coin of top) {
+      const amount = invest / coin.price;
 
       await pool.query(
         `INSERT INTO positions (symbol,entry,amount,cycles,f1,f2,f3,f4)
          VALUES ($1,$2,$3,0,$4,$5,$6,$7)`,
-        [coin.symbol, price, amount, coin.f1, coin.f2, coin.f3, coin.f4]
+        [coin.symbol, coin.price, amount, coin.f1, coin.f2, coin.f3, coin.f4]
       );
 
       await pool.query(
         `INSERT INTO trades (symbol,type,price,pnl)
          VALUES ($1,$2,$3,$4)`,
-        [coin.symbol, "BUY", price, 0]
+        [coin.symbol, "BUY", coin.price, 0]
       );
     }
 
@@ -212,7 +223,7 @@ async function runEngine() {
     [JSON.stringify(weights)]
   );
 
-  return { topCandidates, weights };
+  return { top, weights };
 }
 
 // ================= PERFORMANCE =================
@@ -233,11 +244,11 @@ app.get("/", async (req, res) => {
   try {
     await initDB();
 
-    const { topCandidates, weights } = await runEngine();
+    const { top, weights } = await runEngine();
     const perf = await getPerformance();
 
     res.send(`
-      <h1>🧠 ML Engine v10</h1>
+      <h1>🧠 ML Engine v11 (Live Signals)</h1>
 
       <h3>📊 Performance</h3>
       Trades: ${perf.trades}<br/>
@@ -249,8 +260,8 @@ app.get("/", async (req, res) => {
       w3: ${weights.w3.toFixed(2)}<br/>
       w4: ${weights.w4.toFixed(2)}
 
-      <h3>🏆 Top (Filtered)</h3>
-      ${topCandidates.map(c => `<div>${c.symbol} (${(c.prob*100).toFixed(1)}%)</div>`).join("")}
+      <h3>🏆 Top Picks</h3>
+      ${top.map(c => `<div>${c.symbol} (${(c.prob*100).toFixed(1)}%)</div>`).join("")}
 
       <br/><a href="/history">History</a>
       <br/><a href="/reset">Reset</a>

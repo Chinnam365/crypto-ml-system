@@ -3,28 +3,21 @@ const axios = require("axios");
 const { Pool } = require("pg");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-/* =========================
-   DB
-========================= */
-
+// ================= DB =================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-/* =========================
-   INIT TABLES
-========================= */
-
+// ================= INIT DB =================
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS portfolio (
-      id INT PRIMARY KEY,
-      capital FLOAT,
-      cash FLOAT
-    )
+      id SERIAL PRIMARY KEY,
+      cash FLOAT,
+      total FLOAT
+    );
   `);
 
   await pool.query(`
@@ -32,289 +25,194 @@ async function initDB() {
       id SERIAL PRIMARY KEY,
       symbol TEXT,
       entry FLOAT,
-      quantity FLOAT,
-      capital FLOAT,
-      features JSONB,
-      time BIGINT
-    )
+      amount FLOAT
+    );
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trades (
       id SERIAL PRIMARY KEY,
       symbol TEXT,
+      type TEXT,
+      price FLOAT,
       pnl FLOAT,
-      result INT,
-      time BIGINT
-    )
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS model (
-      id INT PRIMARY KEY,
-      weights JSONB,
-      bias FLOAT
-    )
+      id SERIAL PRIMARY KEY,
+      weights JSONB
+    );
   `);
 
-  // defaults
-  await pool.query(`
-    INSERT INTO portfolio (id, capital, cash)
-    VALUES (1,100,100)
-    ON CONFLICT DO NOTHING
-  `);
+  // init portfolio if empty
+  const p = await pool.query(`SELECT * FROM portfolio`);
+  if (p.rows.length === 0) {
+    await pool.query(
+      `INSERT INTO portfolio (cash, total) VALUES ($1,$2)`,
+      [100, 100]
+    );
+  }
 
-  await pool.query(`
-    INSERT INTO model (id, weights, bias)
-    VALUES (1,'[0,0,0,0,0]',0)
-    ON CONFLICT DO NOTHING
-  `);
+  // init model
+  const m = await pool.query(`SELECT * FROM model`);
+  if (m.rows.length === 0) {
+    await pool.query(
+      `INSERT INTO model (weights) VALUES ($1)`,
+      [JSON.stringify({ momentum: 1, crash: 1 })]
+    );
+  }
 }
 
-/* =========================
-   HELPERS
-========================= */
-
-function safe(n, def = 0) {
-  return isFinite(n) ? n : def;
-}
-
-function sigmoid(x) {
-  return 1 / (1 + Math.exp(-x));
-}
-
-/* =========================
-   MARKET DATA
-========================= */
-
-async function getKlines(symbol, interval) {
+// ================= MARKET =================
+async function getPrices() {
   const res = await axios.get(
-    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=2`
+    "https://api.binance.com/api/v3/ticker/24hr"
   );
-
-  const prev = parseFloat(res.data[0][4]);
-  const curr = parseFloat(res.data[1][4]);
-
-  return safe(((curr - prev) / prev) * 100);
+  return res.data;
 }
 
-async function getMarket(model) {
-  const res = await axios.get("https://api.binance.com/api/v3/ticker/24hr");
+// ================= STRATEGY =================
+function scoreCoin(c) {
+  const change = parseFloat(c.priceChangePercent);
+  const volume = parseFloat(c.quoteVolume);
 
-  const base = res.data
-    .filter(c => c.symbol.endsWith("USDT"))
-    .filter(c => parseFloat(c.quoteVolume) > 5000000)
-    .slice(0, 25);
+  let momentum = change;
+  let crash = change < -5 ? Math.abs(change) * 2 : 0;
 
-  const enriched = [];
-
-  for (let c of base) {
-    try {
-      const [m5, m15, h1, h4] = await Promise.all([
-        getKlines(c.symbol, "5m"),
-        getKlines(c.symbol, "15m"),
-        getKlines(c.symbol, "1h"),
-        getKlines(c.symbol, "4h")
-      ]);
-
-      const features = [
-        safe(m5),
-        safe(m15),
-        safe(h1),
-        safe(h4),
-        safe(parseFloat(c.priceChangePercent))
-      ];
-
-      const z =
-        features.reduce((sum, f, i) => sum + f * model.weights[i], 0) +
-        model.bias;
-
-      const probability = sigmoid(z);
-
-      enriched.push({
-        symbol: c.symbol,
-        price: parseFloat(c.lastPrice),
-        features,
-        probability
-      });
-
-    } catch {}
-  }
-
-  return enriched.sort((a, b) => b.probability - a.probability);
-}
-
-/* =========================
-   TRAIN MODEL
-========================= */
-
-function train(model, features, label) {
-  const lr = 0.01;
-
-  const z =
-    features.reduce((sum, f, i) => sum + f * model.weights[i], 0) +
-    model.bias;
-
-  const pred = sigmoid(z);
-  const error = label - pred;
-
-  model.weights = model.weights.map((w, i) => w + lr * error * features[i]);
-  model.bias += lr * error;
-
-  return model;
-}
-
-/* =========================
-   MAIN LOOP
-========================= */
-
-app.get("/", async (req, res) => {
-
-  await initDB();
-
-  // LOAD STATE
-  const pRes = await pool.query(`SELECT * FROM portfolio WHERE id=1`);
-  let portfolio = pRes.rows[0];
-
-  const mRes = await pool.query(`SELECT * FROM model WHERE id=1`);
-  let model = {
-    weights: mRes.rows[0].weights,
-    bias: mRes.rows[0].bias
+  return {
+    symbol: c.symbol,
+    score: momentum + crash,
+    change
   };
+}
 
-  const posRes = await pool.query(`SELECT * FROM positions`);
-  let positions = posRes.rows;
+// ================= MAIN ENGINE =================
+async function runEngine() {
+  const prices = await getPrices();
 
-  // MARKET
-  const coins = await getMarket(model);
+  const usdt = prices.filter(p => p.symbol.endsWith("USDT"));
 
-  /* ===== BUY ===== */
+  const scored = usdt.map(scoreCoin);
 
-  if (positions.length < 5) {
-    const top = coins.slice(0, 5);
+  const top5 = scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
 
-    const allocation = portfolio.cash / 5;
+  const portfolio = await pool.query(`SELECT * FROM portfolio LIMIT 1`);
+  let cash = portfolio.rows[0].cash;
 
-    for (let c of top) {
-      if (portfolio.cash < allocation) break;
-
-      const qty = allocation / c.price;
-
-      await pool.query(`
-        INSERT INTO positions(symbol, entry, quantity, capital, features, time)
-        VALUES ($1,$2,$3,$4,$5,$6)
-      `, [
-        c.symbol,
-        c.price,
-        qty,
-        allocation,
-        JSON.stringify(c.features),
-        Date.now()
-      ]);
-
-      portfolio.cash -= allocation;
-    }
-  }
-
-  /* ===== UPDATE ===== */
-
-  positions = (await pool.query(`SELECT * FROM positions`)).rows;
-
-  let updated = [];
-  let total = portfolio.cash;
-
-  for (let p of positions) {
-    const coin = coins.find(c => c.symbol === p.symbol);
-    if (!coin) continue;
-
-    const value = p.quantity * coin.price;
-    const pnl = (value - p.capital) / p.capital;
-    const age = (Date.now() - p.time) / 60000;
-
-    if (pnl > 0.005 || pnl < -0.005 || age > 3) {
-
-      const label = pnl > 0 ? 1 : 0;
-
-      model = train(model, p.features, label);
-
-      await pool.query(`
-        INSERT INTO trades(symbol,pnl,result,time)
-        VALUES ($1,$2,$3,$4)
-      `, [p.symbol, pnl, label, Date.now()]);
-
-      portfolio.cash += value;
-
-    } else {
-      updated.push(p);
-      total += value;
-    }
-  }
-
-  // RESET positions table
+  // clear positions (simple rebalance)
   await pool.query(`DELETE FROM positions`);
 
-  for (let p of updated) {
-    await pool.query(`
-      INSERT INTO positions(symbol, entry, quantity, capital, features, time)
-      VALUES ($1,$2,$3,$4,$5,$6)
-    `, [p.symbol, p.entry, p.quantity, p.capital, p.features, p.time]);
+  let invest = cash / top5.length;
+
+  for (let coin of top5) {
+    const price = parseFloat(
+      prices.find(p => p.symbol === coin.symbol).lastPrice
+    );
+
+    const amount = invest / price;
+
+    await pool.query(
+      `INSERT INTO positions (symbol, entry, amount)
+       VALUES ($1,$2,$3)`,
+      [coin.symbol, price, amount]
+    );
+
+    await pool.query(
+      `INSERT INTO trades (symbol,type,price,pnl)
+       VALUES ($1,$2,$3,$4)`,
+      [coin.symbol, "BUY", price, 0]
+    );
   }
 
-  /* ===== SAVE ===== */
+  await pool.query(`UPDATE portfolio SET cash=$1,total=$2`, [0, cash]);
 
-  await pool.query(
-    `UPDATE portfolio SET cash=$1, capital=$2 WHERE id=1`,
-    [portfolio.cash, total]
-  );
+  return top5;
+}
 
-  await pool.query(
-    `UPDATE model SET weights=$1, bias=$2 WHERE id=1`,
-    [model.weights, model.bias]
-  );
+// ================= PERFORMANCE =================
+async function getPerformance() {
+  const t = await pool.query(`SELECT * FROM trades`);
 
-  /* ===== STATS ===== */
+  let wins = 0;
+  let losses = 0;
 
-  const tRes = await pool.query(`SELECT * FROM trades`);
-  const trades = tRes.rows;
+  t.rows.forEach(r => {
+    if (r.pnl > 0) wins++;
+    else if (r.pnl < 0) losses++;
+  });
 
-  const wins = trades.filter(t => t.result === 1).length;
-  const totalTrades = trades.length;
+  let total = wins + losses;
+
+  return {
+    trades: total,
+    winRate: total === 0 ? 0 : ((wins / total) * 100).toFixed(2)
+  };
+}
+
+// ================= ROUTES =================
+app.get("/", async (req, res) => {
+  try {
+    await initDB();
+
+    const top5 = await runEngine();
+
+    const positions = await pool.query(`SELECT * FROM positions`);
+
+    const perf = await getPerformance();
+
+    res.send(`
+      <h1>🧠 ML Engine v6 (Stable)</h1>
+
+      <p>💰 Trading Top 5 coins dynamically</p>
+
+      <h3>📊 Performance</h3>
+      Trades: ${perf.trades}<br/>
+      Win Rate: ${perf.winRate}%
+
+      <h3>🏆 Top 5</h3>
+      ${top5.map(c => `<div>${c.symbol} (${c.score.toFixed(2)})</div>`).join("")}
+
+      <h3>📦 Positions</h3>
+      ${positions.rows.map(p => `<div>${p.symbol}</div>`).join("")}
+
+      <br/><a href="/history">View History</a>
+      <br/><a href="/reset">Reset</a>
+    `);
+  } catch (e) {
+    console.error(e);
+    res.send("ERROR: " + e.message);
+  }
+});
+
+// ================= HISTORY =================
+app.get("/history", async (req, res) => {
+  const t = await pool.query(`SELECT * FROM trades ORDER BY id DESC LIMIT 20`);
 
   res.send(`
-    <body style="background:#0b1220;color:white;padding:20px;font-family:sans-serif">
-
-    <h1>🧠 ML Engine v6 (Persistent)</h1>
-
-    <p>💰 Total: €${total.toFixed(2)}</p>
-    <p>💵 Cash: €${portfolio.cash.toFixed(2)}</p>
-
-    <h3>📊 Performance</h3>
-    <p>Trades: ${totalTrades}</p>
-    <p>Win Rate: ${totalTrades ? ((wins/totalTrades)*100).toFixed(2) : 0}%</p>
-
-    <h3>🧠 Model</h3>
-    <p>${model.weights.map(w=>w.toFixed(3)).join(", ")}</p>
-
-    <h3>🏆 Top Coins</h3>
-    ${coins.slice(0,5).map(c =>
-      `<p>${c.symbol} (${(c.probability*100).toFixed(1)}%)</p>`
-    ).join("")}
-
-    </body>
+    <h2>📜 Trade History</h2>
+    ${t.rows.map(r => `<div>${r.type} ${r.symbol}</div>`).join("")}
+    <br/><a href="/">Back</a>
   `);
-
 });
 
-/* RESET */
-
+// ================= RESET =================
 app.get("/reset", async (req, res) => {
+  await pool.query(`DELETE FROM portfolio`);
   await pool.query(`DELETE FROM positions`);
   await pool.query(`DELETE FROM trades`);
-  await pool.query(`UPDATE portfolio SET capital=100, cash=100`);
-  await pool.query(`UPDATE model SET weights='[0,0,0,0,0]', bias=0`);
-  res.send("Reset done");
+  await pool.query(`DELETE FROM model`);
+
+  res.send("Reset done. Restart app.");
 });
 
+// ================= START =================
+const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-  console.log("Running...");
+  console.log("Server running on port", PORT);
 });

@@ -4,9 +4,7 @@ const axios = require("axios");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* =========================
-   STATE (SAFE - NO DB)
-========================= */
+/* STATE */
 
 let portfolio = { capital: 100, cash: 100 };
 let positions = [];
@@ -21,17 +19,17 @@ let weights = {
 
 let stats = { wins: 0, losses: 0, total: 0 };
 
-/* =========================
-   SAFE FUNCTION
-========================= */
+/* HELPERS */
 
 function safe(n, def = 0) {
   return isFinite(n) ? n : def;
 }
 
-/* =========================
-   FETCH MULTI-TIMEFRAME DATA
-========================= */
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x / 10));
+}
+
+/* MARKET */
 
 async function getKlines(symbol, interval) {
   const res = await axios.get(
@@ -65,11 +63,27 @@ async function getMarket() {
         getKlines(c.symbol, "4h")
       ]);
 
+      const rawScore =
+        weights.short * (m5 + m15) +
+        weights.mid * h1 +
+        weights.long * (h4 + parseFloat(c.priceChangePercent));
+
+      let strategy = "momentum";
+
+      let crashBonus = 0;
+      if (parseFloat(c.priceChangePercent) < -3) {
+        crashBonus = weights.crash * Math.abs(parseFloat(c.priceChangePercent));
+        strategy = "crash";
+      }
+
+      const finalScore = rawScore + crashBonus;
+      const probability = sigmoid(finalScore);
+
       enriched.push({
         symbol: c.symbol,
         price: parseFloat(c.lastPrice),
-        m5, m15, h1, h4,
-        change24: parseFloat(c.priceChangePercent)
+        probability,
+        strategy
       });
 
     } catch {
@@ -77,59 +91,22 @@ async function getMarket() {
     }
   }
 
-  return enriched;
+  return enriched.sort((a, b) => b.probability - a.probability);
 }
 
-/* =========================
-   SCORING ENGINE
-========================= */
+/* TRADING */
 
-function scoreCoins(coins) {
-  return coins.map(c => {
-    let strategy = "momentum";
-
-    let score =
-      weights.short * safe(c.m5 + c.m15) +
-      weights.mid * safe(c.h1) +
-      weights.long * safe(c.h4 + c.change24);
-
-    if (c.change24 < -3) {
-      score += weights.crash * Math.abs(c.change24);
-      strategy = "crash";
-    }
-
-    return { ...c, score, strategy };
-  });
-}
-
-/* =========================
-   SELECT TOP 5 (WITH EXPLORATION)
-========================= */
-
-function pickTop(coins) {
-  coins.sort((a, b) => b.score - a.score);
+function trade(coins) {
+  if (positions.length >= 5) return;
 
   const top = coins.slice(0, 5);
 
-  // exploration (20%)
-  if (Math.random() < 0.2) {
-    const randomCoin = coins[Math.floor(Math.random() * coins.length)];
-    top[4] = randomCoin;
-  }
+  const totalProb = top.reduce((sum, c) => sum + c.probability, 0);
 
-  return top;
-}
+  top.forEach(c => {
+    const weight = c.probability / totalProb;
+    const allocation = portfolio.cash * weight;
 
-/* =========================
-   TRADING
-========================= */
-
-function trade(topCoins) {
-  if (positions.length >= 5) return;
-
-  const allocation = portfolio.cash / 5;
-
-  topCoins.forEach(c => {
     const qty = allocation / c.price;
     if (!isFinite(qty) || qty <= 0) return;
 
@@ -143,13 +120,12 @@ function trade(topCoins) {
     });
 
     portfolio.cash -= allocation;
-    trades.push(`BUY ${c.symbol}`);
+
+    trades.push(`BUY ${c.symbol} (${(c.probability * 100).toFixed(1)}%)`);
   });
 }
 
-/* =========================
-   POSITION UPDATE + LEARNING
-========================= */
+/* UPDATE + LEARNING */
 
 function updatePositions(coins) {
   const updated = [];
@@ -158,13 +134,12 @@ function updatePositions(coins) {
     const coin = coins.find(c => c.symbol === p.symbol);
     if (!coin) return;
 
-    const value = safe(p.quantity) * safe(coin.price);
+    const value = p.quantity * coin.price;
     const pnl = safe((value - p.capital) / p.capital);
     const age = (Date.now() - p.time) / 60000;
 
     if (!isFinite(pnl)) return;
 
-    // SELL conditions
     if (pnl > 0.01 || pnl < -0.01 || age > 10) {
       portfolio.cash += value;
 
@@ -174,7 +149,6 @@ function updatePositions(coins) {
       if (pnl > 0) stats.wins++;
       else stats.losses++;
 
-      // learning
       const delta = pnl > 0 ? 0.05 : -0.05;
 
       if (p.strategy === "momentum") {
@@ -193,36 +167,28 @@ function updatePositions(coins) {
   positions = updated;
 }
 
-/* =========================
-   TOTAL VALUE
-========================= */
+/* TOTAL */
 
 function getTotal(coins) {
-  let total = safe(portfolio.cash);
+  let total = portfolio.cash;
 
   positions.forEach(p => {
     const coin = coins.find(c => c.symbol === p.symbol);
     if (!coin) return;
 
-    const value = safe(p.quantity) * safe(coin.price);
-    if (isFinite(value)) total += value;
+    total += p.quantity * coin.price;
   });
 
   return total;
 }
 
-/* =========================
-   DASHBOARD
-========================= */
+/* DASHBOARD */
 
 app.get("/", async (req, res) => {
   try {
     const coins = await getMarket();
 
-    const scored = scoreCoins(coins);
-    const top = pickTop(scored);
-
-    trade(top);
+    trade(coins);
     updatePositions(coins);
 
     const total = getTotal(coins);
@@ -230,7 +196,7 @@ app.get("/", async (req, res) => {
     res.send(`
     <body style="background:#0b1220;color:white;font-family:sans-serif;padding:20px">
 
-    <h1>🧠 ML Engine v3</h1>
+    <h1>🧠 ML Engine v4</h1>
 
     <p>💰 Total: €${safe(total).toFixed(2)}</p>
     <p>💵 Cash: €${safe(portfolio.cash).toFixed(2)}</p>
@@ -245,12 +211,14 @@ app.get("/", async (req, res) => {
     <p>Long: ${weights.long.toFixed(2)}</p>
     <p>Crash: ${weights.crash.toFixed(2)}</p>
 
-    <h3>🏆 Top 5</h3>
-    ${top.map(c => `<p>${c.symbol} (${c.strategy})</p>`).join("")}
+    <h3>🏆 Top (by probability)</h3>
+    ${coins.slice(0,5).map(c =>
+      `<p>${c.symbol} (${(c.probability*100).toFixed(1)}%)</p>`
+    ).join("")}
 
-    <h3>📦 Positions (${positions.length})</h3>
+    <h3>📦 Positions</h3>
     ${positions.map(p =>
-      `<p>${p.symbol} (${p.strategy}) | ${(safe(p.pnl) * 100).toFixed(2)}%</p>`
+      `<p>${p.symbol} | ${(p.pnl*100).toFixed(2)}%</p>`
     ).join("")}
 
     <h3>📜 Trades</h3>
@@ -260,16 +228,15 @@ app.get("/", async (req, res) => {
     <a href="/reset" style="color:cyan">Reset</a>
 
     </body>
-    `);
+    `
+    );
 
   } catch (e) {
     res.send("Error: " + e.message);
   }
 });
 
-/* =========================
-   RESET
-========================= */
+/* RESET */
 
 app.get("/reset", (req, res) => {
   portfolio = { capital: 100, cash: 100 };
@@ -278,12 +245,10 @@ app.get("/reset", (req, res) => {
   weights = { short: 1, mid: 1, long: 1, crash: 1 };
   stats = { wins: 0, losses: 0, total: 0 };
 
-  res.send("Reset complete");
+  res.send("Reset done");
 });
 
-/* =========================
-   START
-========================= */
+/* START */
 
 app.listen(PORT, () => {
   console.log("Running on port", PORT);

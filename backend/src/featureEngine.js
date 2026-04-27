@@ -29,7 +29,7 @@ function computeMACD(closes) {
   return { macd, signal, hist };
 }
 
-// MAIN FEATURE BUILDER
+// BUILD FEATURES
 async function buildFeatures(symbol) {
   const { rows } = await pool.query(
     `SELECT * FROM candles WHERE symbol=$1 ORDER BY time ASC`,
@@ -94,7 +94,7 @@ async function buildFeatures(symbol) {
     );
   }
 
-  console.log(`Features built for ${symbol}`);
+  console.log("Features built:", symbol);
 }
 
 module.exports = { buildFeatures };

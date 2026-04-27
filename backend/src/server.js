@@ -1,7 +1,9 @@
 const express = require("express");
 const axios = require("axios");
 const { Pool } = require("pg");
+
 const { buildFeatures } = require("./featureEngine");
+const { trainModel } = require("./trainer");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -12,7 +14,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// ===== INIT TABLES =====
+// ===== INIT DB =====
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS candles (
@@ -53,10 +55,28 @@ async function initDB() {
     );
   `);
 
-  console.log("DB initialized");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS model (
+      id SERIAL PRIMARY KEY,
+      w1 FLOAT DEFAULT 0.5,
+      w2 FLOAT DEFAULT 0.5,
+      w3 FLOAT DEFAULT 0.5,
+      w4 FLOAT DEFAULT 0.5,
+      w5 FLOAT DEFAULT 0.5,
+      w6 FLOAT DEFAULT 0.5
+    );
+  `);
+
+  await pool.query(`
+    INSERT INTO model (w1,w2,w3,w4,w5,w6)
+    SELECT 0.5,0.5,0.5,0.5,0.5,0.5
+    WHERE NOT EXISTS (SELECT 1 FROM model);
+  `);
+
+  console.log("✅ DB initialized");
 }
 
-// ===== FETCH HISTORICAL DATA =====
+// ===== FETCH DATA =====
 async function fetchCandles(symbol) {
   try {
     const res = await axios.get(
@@ -76,7 +96,7 @@ async function fetchCandles(symbol) {
   }
 }
 
-// ===== SAVE CANDLES =====
+// ===== SAVE DATA =====
 async function saveCandles(symbol, data) {
   for (let k of data) {
     await pool.query(
@@ -100,21 +120,15 @@ async function saveCandles(symbol, data) {
 
 // Home
 app.get("/", (req, res) => {
-  res.send("ML Engine Running");
+  res.send("ML Engine Running 🚀");
 });
 
-// Collect historical data
+// Collect candles
 app.get("/collect", async (req, res) => {
-  const symbols = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "SOLUSDT",
-    "XRPUSDT"
-  ];
+  const symbols = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"];
 
   for (let s of symbols) {
-    console.log("Downloading:", s);
+    console.log("📥 Fetching:", s);
     const data = await fetchCandles(s);
     await saveCandles(s, data);
   }
@@ -124,43 +138,49 @@ app.get("/collect", async (req, res) => {
 
 // Build features
 app.get("/build-features", async (req, res) => {
-  const symbols = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "SOLUSDT",
-    "XRPUSDT"
-  ];
+  const symbols = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"];
 
   for (let s of symbols) {
     await buildFeatures(s);
   }
 
-  res.send("Feature build completed. Check logs.");
+  res.send("Features built");
 });
 
-// ===== DEBUG ROUTES =====
+// Train model
+app.get("/train", async (req, res) => {
+  await trainModel();
+  res.send("Training completed");
+});
 
-// Count candles
+// ===== DEBUG =====
+
+// Candle count
 app.get("/candles-count", async (req, res) => {
   const r = await pool.query(`SELECT COUNT(*) FROM candles`);
   res.send(`Total candles: ${r.rows[0].count}`);
 });
 
-// Count features
+// Feature count
 app.get("/features-count", async (req, res) => {
   const r = await pool.query(`SELECT COUNT(*) FROM features`);
   res.send(`Total features: ${r.rows[0].count}`);
 });
 
-// Show symbols
+// Symbols
 app.get("/debug-symbols", async (req, res) => {
   const r = await pool.query(`SELECT DISTINCT symbol FROM candles`);
   res.json(r.rows);
 });
 
-// ===== START SERVER =====
+// Model weights
+app.get("/model", async (req, res) => {
+  const r = await pool.query(`SELECT * FROM model LIMIT 1`);
+  res.json(r.rows[0]);
+});
+
+// ===== START =====
 app.listen(PORT, async () => {
   await initDB();
-  console.log(`Server running on ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });

@@ -8,13 +8,13 @@ const pool = new Pool({
 // EMA
 function ema(values, period) {
   const k = 2 / (period + 1);
-  let emaArr = [values[0]];
+  let result = [values[0]];
 
   for (let i = 1; i < values.length; i++) {
-    emaArr.push(values[i] * k + emaArr[i - 1] * (1 - k));
+    result.push(values[i] * k + result[i - 1] * (1 - k));
   }
 
-  return emaArr;
+  return result;
 }
 
 // MACD
@@ -29,14 +29,21 @@ function computeMACD(closes) {
   return { macd, signal, hist };
 }
 
-// BUILD FEATURES
+// MAIN
 async function buildFeatures(symbol) {
+  console.log("➡ Building features for:", symbol);
+
   const { rows } = await pool.query(
     `SELECT * FROM candles WHERE symbol=$1 ORDER BY time ASC`,
     [symbol]
   );
 
-  if (rows.length < 50) return;
+  console.log("Candles found:", rows.length);
+
+  if (rows.length < 50) {
+    console.log("Not enough data, skipping:", symbol);
+    return;
+  }
 
   const closes = rows.map(r => r.close);
   const volumes = rows.map(r => r.volume);
@@ -44,6 +51,7 @@ async function buildFeatures(symbol) {
   const { macd, signal, hist } = computeMACD(closes);
 
   let obv = 0;
+  let inserted = 0;
 
   for (let i = 30; i < rows.length; i++) {
     const r = rows[i];
@@ -92,9 +100,11 @@ async function buildFeatures(symbol) {
         distHigh
       ]
     );
+
+    inserted++;
   }
 
-  console.log("Features built:", symbol);
+  console.log(`✅ Inserted ${inserted} features for ${symbol}`);
 }
 
 module.exports = { buildFeatures };

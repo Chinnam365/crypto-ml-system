@@ -4,15 +4,15 @@ const { Pool } = require("pg");
 const { buildFeatures } = require("./featureEngine");
 
 const app = express();
+const PORT = process.env.PORT || 10000;
 
+// ===== DB CONNECTION =====
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-const PORT = process.env.PORT || 10000;
-
-// INIT DB
+// ===== INIT TABLES =====
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS candles (
@@ -52,24 +52,31 @@ async function initDB() {
       UNIQUE(symbol, time)
     );
   `);
+
+  console.log("DB initialized");
 }
 
-// FETCH BINANCE DATA
+// ===== FETCH HISTORICAL DATA =====
 async function fetchCandles(symbol) {
-  const res = await axios.get(
-    `https://api.binance.com/api/v3/klines`,
-    {
-      params: {
-        symbol,
-        interval: "5m",
-        limit: 1000
+  try {
+    const res = await axios.get(
+      "https://api.binance.com/api/v3/klines",
+      {
+        params: {
+          symbol,
+          interval: "5m",
+          limit: 1000
+        }
       }
-    }
-  );
-  return res.data;
+    );
+    return res.data;
+  } catch (err) {
+    console.log("Error fetching:", symbol);
+    return [];
+  }
 }
 
-// SAVE CANDLES
+// ===== SAVE CANDLES =====
 async function saveCandles(symbol, data) {
   for (let k of data) {
     await pool.query(
@@ -79,21 +86,35 @@ async function saveCandles(symbol, data) {
       [
         symbol,
         k[0],
-        k[1],
-        k[2],
-        k[3],
-        k[4],
-        k[5]
+        parseFloat(k[1]),
+        parseFloat(k[2]),
+        parseFloat(k[3]),
+        parseFloat(k[4]),
+        parseFloat(k[5])
       ]
     );
   }
 }
 
-// ROUTE: COLLECT DATA
+// ===== ROUTES =====
+
+// Home
+app.get("/", (req, res) => {
+  res.send("ML Engine Running");
+});
+
+// Collect historical data
 app.get("/collect", async (req, res) => {
-  const symbols = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"];
+  const symbols = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT"
+  ];
 
   for (let s of symbols) {
+    console.log("Downloading:", s);
     const data = await fetchCandles(s);
     await saveCandles(s, data);
   }
@@ -101,39 +122,44 @@ app.get("/collect", async (req, res) => {
   res.send("Candles collected");
 });
 
-// ROUTE: BUILD FEATURES
+// Build features
 app.get("/build-features", async (req, res) => {
-  const symbols = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"];
+  const symbols = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT"
+  ];
 
   for (let s of symbols) {
     await buildFeatures(s);
   }
 
-  res.send("Features built successfully");
+  res.send("Feature build completed. Check logs.");
 });
-app.get("/debug-candles", async (req, res) => {
-  const r = await pool.query(`SELECT symbol, COUNT(*) FROM candles GROUP BY symbol`);
-  res.json(r.rows);
+
+// ===== DEBUG ROUTES =====
+
+// Count candles
+app.get("/candles-count", async (req, res) => {
+  const r = await pool.query(`SELECT COUNT(*) FROM candles`);
+  res.send(`Total candles: ${r.rows[0].count}`);
 });
-// ROUTE: COUNT FEATURES
+
+// Count features
 app.get("/features-count", async (req, res) => {
   const r = await pool.query(`SELECT COUNT(*) FROM features`);
   res.send(`Total features: ${r.rows[0].count}`);
 });
-app.get("/candles-count", async (req, res) => {
-  try {
-    const r = await pool.query(`SELECT COUNT(*) FROM candles`);
-    res.send(`Total candles: ${r.rows[0].count}`);
-  } catch (err) {
-    res.send("Error reading candles");
-  }
-});
-// ROOT
-app.get("/", (req, res) => {
-  res.send("ML Engine Running");
+
+// Show symbols
+app.get("/debug-symbols", async (req, res) => {
+  const r = await pool.query(`SELECT DISTINCT symbol FROM candles`);
+  res.json(r.rows);
 });
 
-// START SERVER
+// ===== START SERVER =====
 app.listen(PORT, async () => {
   await initDB();
   console.log(`Server running on ${PORT}`);

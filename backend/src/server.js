@@ -111,7 +111,10 @@ app.get("/build-features", async (req, res) => {
 
   res.send("Features built successfully");
 });
-
+app.get("/debug-candles", async (req, res) => {
+  const r = await pool.query(`SELECT symbol, COUNT(*) FROM candles GROUP BY symbol`);
+  res.json(r.rows);
+});
 // ROUTE: COUNT FEATURES
 app.get("/features-count", async (req, res) => {
   const r = await pool.query(`SELECT COUNT(*) FROM features`);

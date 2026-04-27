@@ -1,7 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const { Pool } = require("pg");
-
+const { buildFeatures } = require("./featureEngine");
 const app = express();
 
 // ================= DB =================
@@ -345,3 +345,18 @@ async function start() {
 }
 
 start();
+app.get("/build-features", async (req, res) => {
+  const symbols = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT"
+  ];
+
+  for (let s of symbols) {
+    await buildFeatures(s);
+  }
+
+  res.send("Features built successfully");
+});

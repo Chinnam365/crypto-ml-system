@@ -3,7 +3,6 @@ const axios = require("axios");
 const { Pool } = require("pg");
 
 const app = express();
-app.use(express.json());
 
 /* ================= DB ================= */
 const pool = new Pool({
@@ -52,7 +51,7 @@ async function initDB() {
     );
   `);
 
-  // default weights
+  // default model
   await pool.query(`
     INSERT INTO model (w1,w2,w3,w4,w5)
     SELECT 0.5,0.5,0.5,0.5,0.5
@@ -60,32 +59,22 @@ async function initDB() {
   `);
 }
 
-/* ================= FETCH DATA ================= */
+/* ================= FETCH ================= */
 async function fetchCandles(symbol) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=5m&limit=500`;
-
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=5m&limit=200`;
   const res = await axios.get(url);
 
   for (let c of res.data) {
     await pool.query(
       `INSERT INTO candles (symbol,time,open,high,low,close,volume)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT DO NOTHING`,
-      [
-        symbol,
-        c[0],
-        c[1],
-        c[2],
-        c[3],
-        c[4],
-        c[5]
-      ]
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [symbol, c[0], c[1], c[2], c[3], c[4], c[5]]
     );
   }
 }
 
-/* ================= MACD ================= */
-function calcEMA(values, period) {
+/* ================= INDICATORS ================= */
+function ema(values, period) {
   const k = 2 / (period + 1);
   let ema = values[0];
   return values.map(v => {
@@ -94,18 +83,18 @@ function calcEMA(values, period) {
   });
 }
 
-function calcMACD(closes) {
-  const ema12 = calcEMA(closes, 12);
-  const ema26 = calcEMA(closes, 26);
+function macdCalc(closes) {
+  const ema12 = ema(closes, 12);
+  const ema26 = ema(closes, 26);
 
   const macd = ema12.map((v, i) => v - ema26[i]);
-  const signal = calcEMA(macd, 9);
+  const signal = ema(macd, 9);
   const hist = macd.map((v, i) => v - signal[i]);
 
   return { macd, signal, hist };
 }
 
-/* ================= BUILD FEATURES ================= */
+/* ================= FEATURES ================= */
 async function buildFeatures(symbol) {
   const res = await pool.query(
     `SELECT * FROM candles WHERE symbol=$1 ORDER BY time ASC`,
@@ -118,7 +107,7 @@ async function buildFeatures(symbol) {
   const closes = rows.map(r => r.close);
   const volumes = rows.map(r => r.volume);
 
-  const { macd, signal, hist } = calcMACD(closes);
+  const { macd, signal, hist } = macdCalc(closes);
 
   for (let i = 30; i < rows.length; i++) {
     const momentum = closes[i] - closes[i - 5];
@@ -127,8 +116,7 @@ async function buildFeatures(symbol) {
     await pool.query(
       `INSERT INTO features
        (symbol,time,close,volume,macd,macd_signal,macd_hist,momentum,volatility)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       ON CONFLICT DO NOTHING`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
       [
         symbol,
         rows[i].time,
@@ -144,22 +132,22 @@ async function buildFeatures(symbol) {
   }
 }
 
-/* ================= TRAIN MODEL ================= */
+/* ================= TRAIN ================= */
 async function trainModel() {
-  const data = await pool.query(
+  const res = await pool.query(
     `SELECT * FROM features ORDER BY time DESC LIMIT 500`
   );
 
-  if (data.rows.length < 50) return;
+  if (res.rows.length < 50) return;
 
   let w = [0.5, 0.5, 0.5, 0.5, 0.5];
   let lr = 0.0001;
 
-  for (let i = 1; i < data.rows.length; i++) {
-    const f = data.rows[i];
-    const prev = data.rows[i - 1];
+  for (let i = 1; i < res.rows.length; i++) {
+    const f = res.rows[i];
+    const prev = res.rows[i - 1];
 
-    const target = (f.close - prev.close) > 0 ? 1 : 0;
+    const target = f.close > prev.close ? 1 : 0;
 
     const x = [
       f.macd,
@@ -169,7 +157,7 @@ async function trainModel() {
       f.volatility
     ];
 
-    const score = w.reduce((sum, wi, j) => sum + wi * x[j], 0);
+    const score = w.reduce((s, wi, j) => s + wi * x[j], 0);
     const pred = score > 0 ? 1 : 0;
     const error = target - pred;
 
@@ -188,7 +176,7 @@ async function trainModel() {
   console.log("Model trained:", w);
 }
 
-/* ================= ENGINE LOOP ================= */
+/* ================= ENGINE ================= */
 const symbols = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT"];
 
 async function runEngine() {
@@ -206,8 +194,7 @@ async function runEngine() {
   }
 }
 
-/* ================= SAFE LOOP ================= */
-setInterval(runEngine, 60 * 1000); // every 1 min
+setInterval(runEngine, 60000);
 
 /* ================= ROUTES ================= */
 
@@ -216,37 +203,34 @@ app.get("/", (req, res) => {
 });
 
 app.get("/status", async (req, res) => {
-  const candles = await pool.query(`SELECT COUNT(*) FROM candles`);
-  const features = await pool.query(`SELECT COUNT(*) FROM features`);
+  const c = await pool.query(`SELECT COUNT(*) FROM candles`);
+  const f = await pool.query(`SELECT COUNT(*) FROM features`);
+
   res.json({
-    candles: candles.rows[0].count,
-    features: features.rows[0].count
+    candles: c.rows[0].count,
+    features: f.rows[0].count
   });
 });
 
+/* ✅ FIXED MODEL ROUTE */
 app.get("/model", async (req, res) => {
-  const m = await pool.query(`SELECT * FROM model LIMIT 1`);
+  const m = await pool.query(`
+    SELECT * FROM model ORDER BY id DESC LIMIT 1
+  `);
   res.json(m.rows[0] || {});
 });
 
 app.get("/train", async (req, res) => {
-  try {
-    await trainModel();
-    res.send("Training done");
-  } catch (e) {
-    res.send("Training failed");
-  }
+  await trainModel();
+  res.send("Training done");
 });
 
 /* ================= START ================= */
 const PORT = process.env.PORT || 10000;
 
-initDB()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log("Server running on", PORT);
-    });
-  })
-  .catch(err => {
-    console.error("DB init failed:", err);
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log("Server running on", PORT);
   });
+});
+

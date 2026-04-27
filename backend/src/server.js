@@ -120,7 +120,14 @@ app.get("/features-count", async (req, res) => {
   const r = await pool.query(`SELECT COUNT(*) FROM features`);
   res.send(`Total features: ${r.rows[0].count}`);
 });
-
+app.get("/candles-count", async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT COUNT(*) FROM candles`);
+    res.send(`Total candles: ${r.rows[0].count}`);
+  } catch (err) {
+    res.send("Error reading candles");
+  }
+});
 // ROOT
 app.get("/", (req, res) => {
   res.send("ML Engine Running");

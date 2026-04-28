@@ -43,13 +43,14 @@ async function initDB() {
     `);
 
     await pool.query(`
-      ALTER TABLE trades
-      ADD COLUMN IF NOT EXISTS symbol TEXT,
-      ADD COLUMN IF NOT EXISTS entry_price FLOAT,
-      ADD COLUMN IF NOT EXISTS exit_price FLOAT,
-      ADD COLUMN IF NOT EXISTS result FLOAT,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
-    `);
+  ALTER TABLE trades
+  ADD COLUMN IF NOT EXISTS symbol TEXT,
+  ADD COLUMN IF NOT EXISTS type TEXT,
+  ADD COLUMN IF NOT EXISTS entry_price FLOAT,
+  ADD COLUMN IF NOT EXISTS exit_price FLOAT,
+  ADD COLUMN IF NOT EXISTS result FLOAT,
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+`);
 
     console.log("✅ DB schema ready");
   } catch (err) {

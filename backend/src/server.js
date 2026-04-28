@@ -260,3 +260,34 @@ app.listen(PORT, () => {
     console.error("Startup error:", err.message);
   }
 })();
+async function runEngine() {
+  try {
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("timeout")), 10000)
+    );
+
+    await Promise.race([
+      (async () => {
+        let priceMap = {};
+
+        for (let symbol of symbols) {
+          const candles = await fetchCandles(symbol);
+          const f = computeFeatures(candles);
+
+          priceMap[symbol] = f.close;
+
+          if (shouldBuy(f)) {
+            await createTrade(symbol, f.close);
+          }
+        }
+
+        await evaluateTrades(priceMap);
+      })(),
+      timeout,
+    ]);
+
+    console.log("Engine tick done");
+  } catch (err) {
+    console.error("ENGINE ERROR:", err.message);
+  }
+}

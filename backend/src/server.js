@@ -4,7 +4,7 @@ const { Pool } = require("pg");
 
 const app = express();
 app.use(express.json());
-
+ 
 const PORT = process.env.PORT || 10000;
 
 // ================= DB =================

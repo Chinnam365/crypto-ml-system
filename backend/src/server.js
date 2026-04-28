@@ -10,41 +10,48 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ================= SAFE DB INIT =================
+// ================= DB INIT (SAFE + MIGRATION) =================
 async function initDB() {
   try {
-    // MODEL
+    // ===== MODEL =====
     await pool.query(`
       CREATE TABLE IF NOT EXISTS model (
-        id SERIAL PRIMARY KEY,
-        w1 FLOAT DEFAULT 0.5,
-        w2 FLOAT DEFAULT 0.5,
-        w3 FLOAT DEFAULT 0.5,
-        w4 FLOAT DEFAULT 0.5,
-        w5 FLOAT DEFAULT 0.5
+        id SERIAL PRIMARY KEY
       );
     `);
 
-    // INSERT DEFAULT MODEL IF EMPTY
+    await pool.query(`
+      ALTER TABLE model
+      ADD COLUMN IF NOT EXISTS w1 FLOAT DEFAULT 0.5,
+      ADD COLUMN IF NOT EXISTS w2 FLOAT DEFAULT 0.5,
+      ADD COLUMN IF NOT EXISTS w3 FLOAT DEFAULT 0.5,
+      ADD COLUMN IF NOT EXISTS w4 FLOAT DEFAULT 0.5,
+      ADD COLUMN IF NOT EXISTS w5 FLOAT DEFAULT 0.5;
+    `);
+
     await pool.query(`
       INSERT INTO model (w1,w2,w3,w4,w5)
       SELECT 0.5,0.5,0.5,0.5,0.5
       WHERE NOT EXISTS (SELECT 1 FROM model);
     `);
 
-    // TRADES
+    // ===== TRADES =====
     await pool.query(`
       CREATE TABLE IF NOT EXISTS trades (
-        id SERIAL PRIMARY KEY,
-        symbol TEXT,
-        entry_price FLOAT,
-        exit_price FLOAT,
-        result FLOAT,
-        created_at TIMESTAMP DEFAULT NOW()
+        id SERIAL PRIMARY KEY
       );
     `);
 
-    console.log("✅ DB initialized");
+    await pool.query(`
+      ALTER TABLE trades
+      ADD COLUMN IF NOT EXISTS symbol TEXT,
+      ADD COLUMN IF NOT EXISTS entry_price FLOAT,
+      ADD COLUMN IF NOT EXISTS exit_price FLOAT,
+      ADD COLUMN IF NOT EXISTS result FLOAT,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+    `);
+
+    console.log("✅ DB schema ready");
   } catch (err) {
     console.error("❌ DB init error:", err.message);
   }
@@ -58,44 +65,34 @@ let stats = {
 
 async function runEngine() {
   try {
-    // GET MODEL
     const res = await pool.query(
       "SELECT * FROM model ORDER BY id DESC LIMIT 1"
     );
+
     const model = res.rows[0];
+    if (!model) return;
 
-    if (!model) {
-      console.log("No model yet");
-      return;
-    }
-
-    // SIMULATED TRADE
+    // SIMULATION (your logic can be replaced later)
     const entry = Math.random() * 100;
-    const move = Math.random();
+    const win = Math.random() > 0.5;
 
-    let exit, result;
-
-    if (move > 0.5) {
-      exit = entry * 1.01; // +1%
-      result = 1;
-      stats.wins++;
-    } else {
-      exit = entry * 0.995; // -0.5%
-      result = 0;
-    }
+    const exit = win ? entry * 1.01 : entry * 0.995;
+    const result = win ? 1 : 0;
 
     stats.trades++;
+    if (win) stats.wins++;
 
-    // SAVE TRADE
     await pool.query(
       `INSERT INTO trades (symbol, entry_price, exit_price, result)
        VALUES ($1,$2,$3,$4)`,
       ["SIM", entry, exit, result]
     );
 
-    console.log(`Trade #${stats.trades} | WinRate: ${(stats.wins / stats.trades * 100).toFixed(2)}%`);
+    console.log(
+      `Trade ${stats.trades} | WinRate ${(stats.wins / stats.trades * 100).toFixed(2)}%`
+    );
 
-    // CLEANUP (avoid Neon limit)
+    // CLEANUP to avoid Neon limit
     if (stats.trades % 50 === 0) {
       await pool.query(`
         DELETE FROM trades
@@ -105,7 +102,6 @@ async function runEngine() {
       `);
       console.log("🧹 Cleanup done");
     }
-
   } catch (err) {
     console.error("Engine error:", err.message);
   }
@@ -120,12 +116,12 @@ app.get("/", (req, res) => {
     : 0;
 
   res.send(`
-    <h1>🧠 ML Engine v12.2 (Stable)</h1>
+    <h1>🧠 ML Engine v13 (Stable)</h1>
     <p>Trades: ${stats.trades}</p>
     <p>Win Rate: ${winRate}%</p>
-    <a href="/history">History</a><br/>
     <a href="/status">Status</a><br/>
-    <a href="/model">Model</a>
+    <a href="/model">Model</a><br/>
+    <a href="/history">History</a>
   `);
 });
 
@@ -181,6 +177,6 @@ app.listen(PORT, async () => {
 
   console.log("✅ Startup complete");
 
-  // START ENGINE AFTER SERVER IS LIVE
+  // Run engine every 5 sec (non-blocking)
   setInterval(runEngine, 5000);
 });

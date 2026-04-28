@@ -8,7 +8,7 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
-
+ 
 let trades = 0;
 let wins = 0;
 let dbReady = false;

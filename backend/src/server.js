@@ -56,13 +56,13 @@ async function initDB() {
       model = res.rows[0];
     }
 
-    console.log("DB ready");
+    console.log("DB initialized");
   } catch (err) {
-    console.error("DB INIT ERROR:", err.message);
+    console.error("DB ERROR:", err.message);
   }
 }
 
-// ================= FETCH =================
+// ================= DATA =================
 async function fetchCandles(symbol) {
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=20`;
   const res = await axios.get(url);
@@ -93,7 +93,7 @@ function shouldBuy(f) {
   return predict(f) > 0;
 }
 
-// ================= TRADING =================
+// ================= TRADES =================
 async function createTrade(symbol, price) {
   await pool.query(
     `INSERT INTO trades (symbol, entry_price, timestamp)
@@ -121,7 +121,7 @@ async function evaluateTrades(priceMap) {
         [current, change, t.id]
       );
 
-      // learning
+      // Learning
       if (change > 0) model.w1 += 0.01;
       else model.w1 -= 0.01;
 
@@ -154,7 +154,7 @@ async function runEngine() {
 
     await evaluateTrades(priceMap);
 
-    console.log("Engine tick");
+    console.log("Engine tick done");
   } catch (err) {
     console.error("ENGINE ERROR:", err.message);
   }
@@ -162,54 +162,91 @@ async function runEngine() {
 
 // ================= ROUTES =================
 
-// DEBUG (VERY IMPORTANT)
+// Debug
 app.get("/test", (req, res) => {
-  res.send("SERVER WORKING ✅");
+  res.send("OK");
 });
 
-app.get("/", (req, res) => {
-  res.send("ML Engine Running");
+// Home UI
+app.get("/", async (req, res) => {
+  try {
+    const trades = await pool.query(`SELECT * FROM trades`);
+    const wins = trades.rows.filter(t => t.result > 0).length;
+
+    const winRate = trades.rows.length
+      ? ((wins / trades.rows.length) * 100).toFixed(2)
+      : 0;
+
+    res.send(`
+      <h1>ML Engine v12.1 (Stable)</h1>
+      <p>Trades: ${trades.rows.length}</p>
+      <p>Win Rate: ${winRate}%</p>
+      <a href="/history">History</a><br/>
+      <a href="/status">Status API</a><br/>
+      <a href="/model">Model API</a>
+    `);
+  } catch (err) {
+    res.send(err.message);
+  }
 });
 
+// STATUS
 app.get("/status", async (req, res) => {
   try {
     const trades = await pool.query(`SELECT * FROM trades`);
     const wins = trades.rows.filter(t => t.result > 0).length;
 
-    res.json({
+    const result = {
       trades: trades.rows.length,
       winRate: trades.rows.length
         ? (wins / trades.rows.length) * 100
         : 0,
-    });
+    };
+
+    console.log("STATUS HIT:", result);
+    res.json(result);
   } catch (err) {
+    console.error("STATUS ERROR:", err.message);
     res.json({ error: err.message });
   }
 });
 
+// MODEL
 app.get("/model", async (req, res) => {
   try {
     const m = await pool.query(`SELECT * FROM model LIMIT 1`);
+
+    console.log("MODEL HIT:", m.rows[0]);
     res.json(m.rows[0] || {});
   } catch (err) {
+    console.error("MODEL ERROR:", err.message);
     res.json({ error: err.message });
   }
 });
 
+// HISTORY
 app.get("/history", async (req, res) => {
   try {
     const t = await pool.query(
       `SELECT * FROM trades ORDER BY id DESC LIMIT 20`
     );
-    res.json(t.rows);
+
+    res.send(
+      t.rows
+        .map(
+          r =>
+            `BUY ${r.symbol} ${((r.result || 0) * 100).toFixed(2)}%`
+        )
+        .join("<br>")
+    );
   } catch (err) {
-    res.json({ error: err.message });
+    res.send(err.message);
   }
 });
 
 // ================= START =================
 app.listen(PORT, async () => {
-  console.log("Running on port", PORT);
+  console.log("Server running on", PORT);
 
   await initDB();
 

@@ -19,7 +19,7 @@ async function initDB() {
         id SERIAL PRIMARY KEY
       );
     `);
-
+ 
     await pool.query(`
       ALTER TABLE model
       ADD COLUMN IF NOT EXISTS w1 FLOAT DEFAULT 0.5,

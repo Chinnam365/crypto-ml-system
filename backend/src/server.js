@@ -219,7 +219,12 @@ app.get("/model", async (req, res) => {
   const r = await pool.query("SELECT * FROM model LIMIT 1");
   res.json(r.rows[0]);
 });
-
+app.get("/test", (req, res) => {
+  res.send("NEW CODE LIVE");
+});
+app.get("/", (req, res) => {
+  res.send("ML Engine v2 Running");
+});
 app.get("/train", async (req, res) => {
   await trainModel();
   res.send("trained");

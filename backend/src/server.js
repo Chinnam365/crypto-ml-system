@@ -202,7 +202,7 @@ async function runEngine() {
 }
 
 // ================= ROUTES =================
-app.get("/", (req, res) => res.send("ML Engine Running"));
+app.get("/", (req, res) => res.send("ML Engine v2 LIVE"));
 
 app.get("/status", async (req, res) => {
   const c = await pool.query("SELECT COUNT(*) FROM candles");

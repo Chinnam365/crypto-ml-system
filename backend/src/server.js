@@ -245,10 +245,18 @@ app.get("/history", async (req, res) => {
 });
 
 // ================= START =================
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log("Server running on", PORT);
-
-  await initDB();
-
-  setInterval(runEngine, 15000);
 });
+
+// Run async AFTER server starts (non-blocking)
+(async () => {
+  try {
+    await initDB();
+    console.log("DB ready");
+
+    setInterval(runEngine, 15000);
+  } catch (err) {
+    console.error("Startup error:", err.message);
+  }
+})();

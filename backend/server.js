@@ -11,7 +11,7 @@ const pool = new Pool({
 
 let trades = 0;
 let wins = 0;
-
+ 
 // =========================
 // DB INIT (SAFE + COMPLETE)
 // =========================

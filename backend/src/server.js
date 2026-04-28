@@ -7,6 +7,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
+// ================= DB =================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -14,50 +15,56 @@ const pool = new Pool({
 
 let model = { w1: 0.5, w2: 0.5 };
 
-// ================= DB INIT =================
+// ================= INIT DB =================
 async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS candles (
-      id SERIAL PRIMARY KEY,
-      symbol TEXT,
-      close FLOAT,
-      timestamp BIGINT
-    );
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS candles (
+        id SERIAL PRIMARY KEY,
+        symbol TEXT,
+        close FLOAT,
+        timestamp BIGINT
+      );
 
-    CREATE TABLE IF NOT EXISTS features (
-      id SERIAL PRIMARY KEY,
-      symbol TEXT,
-      close FLOAT,
-      momentum FLOAT
-    );
+      CREATE TABLE IF NOT EXISTS features (
+        id SERIAL PRIMARY KEY,
+        symbol TEXT,
+        close FLOAT,
+        momentum FLOAT
+      );
 
-    CREATE TABLE IF NOT EXISTS model (
-      id SERIAL PRIMARY KEY,
-      w1 FLOAT,
-      w2 FLOAT
-    );
+      CREATE TABLE IF NOT EXISTS model (
+        id SERIAL PRIMARY KEY,
+        w1 FLOAT,
+        w2 FLOAT
+      );
 
-    CREATE TABLE IF NOT EXISTS trades (
-      id SERIAL PRIMARY KEY,
-      symbol TEXT,
-      entry_price FLOAT,
-      exit_price FLOAT,
-      result FLOAT,
-      timestamp BIGINT
-    );
-  `);
+      CREATE TABLE IF NOT EXISTS trades (
+        id SERIAL PRIMARY KEY,
+        symbol TEXT,
+        entry_price FLOAT,
+        exit_price FLOAT,
+        result FLOAT,
+        timestamp BIGINT
+      );
+    `);
 
-  const res = await pool.query(`SELECT * FROM model LIMIT 1`);
-  if (res.rows.length === 0) {
-    await pool.query(`INSERT INTO model (w1,w2) VALUES (0.5,0.5)`);
-  } else {
-    model = res.rows[0];
+    const res = await pool.query(`SELECT * FROM model LIMIT 1`);
+    if (res.rows.length === 0) {
+      await pool.query(`INSERT INTO model (w1,w2) VALUES (0.5,0.5)`);
+    } else {
+      model = res.rows[0];
+    }
+
+    console.log("DB ready");
+  } catch (err) {
+    console.error("DB INIT ERROR:", err.message);
   }
 }
 
-// ================= FETCH DATA =================
+// ================= FETCH =================
 async function fetchCandles(symbol) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=50`;
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=20`;
   const res = await axios.get(url);
 
   return res.data.map(c => ({
@@ -84,26 +91,6 @@ function predict(f) {
 
 function shouldBuy(f) {
   return predict(f) > 0;
-}
-
-// ================= STORE =================
-async function storeCandles(symbol, candles) {
-  for (let c of candles) {
-    await pool.query(
-      `INSERT INTO candles (symbol, close, timestamp)
-       VALUES ($1,$2,$3)
-       ON CONFLICT DO NOTHING`,
-      [symbol, c.close, c.time]
-    );
-  }
-}
-
-async function storeFeatures(symbol, f) {
-  await pool.query(
-    `INSERT INTO features (symbol, close, momentum)
-     VALUES ($1,$2,$3)`,
-    [symbol, f.close, f.momentum]
-  );
 }
 
 // ================= TRADING =================
@@ -134,38 +121,19 @@ async function evaluateTrades(priceMap) {
         [current, change, t.id]
       );
 
-      updateModel(change);
+      // learning
+      if (change > 0) model.w1 += 0.01;
+      else model.w1 -= 0.01;
+
+      await pool.query(
+        `UPDATE model SET w1=$1, w2=$2 WHERE id=1`,
+        [model.w1, model.w2]
+      );
     }
   }
 }
 
-// ================= LEARNING =================
-async function updateModel(result) {
-  if (result > 0) model.w1 += 0.01;
-  else model.w1 -= 0.01;
-
-  await pool.query(
-    `UPDATE model SET w1=$1, w2=$2 WHERE id=1`,
-    [model.w1, model.w2]
-  );
-}
-
-// ================= CLEANUP =================
-async function cleanup() {
-  await pool.query(`
-    DELETE FROM candles WHERE id NOT IN (
-      SELECT id FROM candles ORDER BY id DESC LIMIT 5000
-    );
-  `);
-
-  await pool.query(`
-    DELETE FROM features WHERE id NOT IN (
-      SELECT id FROM features ORDER BY id DESC LIMIT 5000
-    );
-  `);
-}
-
-// ================= ENGINE LOOP =================
+// ================= ENGINE =================
 const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT"];
 
 async function runEngine() {
@@ -174,12 +142,7 @@ async function runEngine() {
 
     for (let symbol of symbols) {
       const candles = await fetchCandles(symbol);
-
-      await storeCandles(symbol, candles);
-
       const f = computeFeatures(candles);
-
-      await storeFeatures(symbol, f);
 
       priceMap[symbol] = f.close;
 
@@ -191,45 +154,64 @@ async function runEngine() {
 
     await evaluateTrades(priceMap);
 
-    await cleanup();
-
-    console.log("Engine cycle complete");
+    console.log("Engine tick");
   } catch (err) {
-    console.error("Engine error:", err.message);
+    console.error("ENGINE ERROR:", err.message);
   }
 }
 
 // ================= ROUTES =================
+
+// DEBUG (VERY IMPORTANT)
+app.get("/test", (req, res) => {
+  res.send("SERVER WORKING ✅");
+});
+
 app.get("/", (req, res) => {
   res.send("ML Engine Running");
 });
 
 app.get("/status", async (req, res) => {
-  const trades = await pool.query(`SELECT * FROM trades`);
-  const wins = trades.rows.filter(t => t.result > 0).length;
+  try {
+    const trades = await pool.query(`SELECT * FROM trades`);
+    const wins = trades.rows.filter(t => t.result > 0).length;
 
-  res.json({
-    trades: trades.rows.length,
-    winRate: trades.rows.length
-      ? (wins / trades.rows.length) * 100
-      : 0,
-  });
+    res.json({
+      trades: trades.rows.length,
+      winRate: trades.rows.length
+        ? (wins / trades.rows.length) * 100
+        : 0,
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
 });
 
 app.get("/model", async (req, res) => {
-  const m = await pool.query(`SELECT * FROM model LIMIT 1`);
-  res.json(m.rows[0]);
+  try {
+    const m = await pool.query(`SELECT * FROM model LIMIT 1`);
+    res.json(m.rows[0] || {});
+  } catch (err) {
+    res.json({ error: err.message });
+  }
 });
 
 app.get("/history", async (req, res) => {
-  const t = await pool.query(`SELECT * FROM trades ORDER BY id DESC LIMIT 20`);
-  res.json(t.rows);
+  try {
+    const t = await pool.query(
+      `SELECT * FROM trades ORDER BY id DESC LIMIT 20`
+    );
+    res.json(t.rows);
+  } catch (err) {
+    res.json({ error: err.message });
+  }
 });
 
 // ================= START =================
 app.listen(PORT, async () => {
-  console.log("Server running on", PORT);
+  console.log("Running on port", PORT);
+
   await initDB();
 
-  setInterval(runEngine, 15000); // every 15 sec
+  setInterval(runEngine, 15000);
 });

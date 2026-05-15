@@ -1,5 +1,5 @@
 {
-  "name": "crypto-ml-backend",
+  "name": "crypto-ml-clean",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
